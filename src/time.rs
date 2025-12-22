@@ -107,10 +107,12 @@ impl TimeRange {
         }
     }
 
+    /// Returns `true` if this range has no end time.
     pub const fn is_open_ended(&self) -> bool {
         self.to.is_none()
     }
 
+    /// Returns `true` if the end time is in the past.
     pub fn has_ended(&self) -> bool {
         match self.to {
             Some(to) => to <= Utc::now(),
@@ -118,6 +120,7 @@ impl TimeRange {
         }
     }
 
+    /// Returns `true` if the current time falls within this range.
     pub fn is_active(&self) -> bool {
         self.contains(Utc::now())
     }
@@ -128,6 +131,7 @@ impl TimeRange {
         time >= self.from && self.to.map_or(true, |to| time < to)
     }
 
+    /// Returns `true` if this range overlaps with another.
     pub fn overlaps(&self, other: &Self) -> bool {
         let self_end = self.to.unwrap_or(DateTime::<Utc>::MAX_UTC);
         let other_end = other.to.unwrap_or(DateTime::<Utc>::MAX_UTC);
@@ -152,10 +156,12 @@ impl TimeRange {
         Some(Self { from, to })
     }
 
+    /// Returns the duration of this range, or `None` if open-ended.
     pub fn duration(&self) -> Option<Duration> {
         self.to.map(|to| to - self.from)
     }
 
+    /// Extends the end time by the given duration (no-op if open-ended).
     pub fn extend_by(&mut self, duration: Duration) {
         if let Some(to) = self.to.as_mut() {
             *to = *to + duration;

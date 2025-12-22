@@ -88,7 +88,7 @@ impl From<EntityId> for Uuid {
 /// Entity types help organize beliefs and can be used for
 /// pattern matching and constraint enforcement.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "String", into = "String")]
 pub enum EntityType {
     /// A human person
     Person,
@@ -106,6 +106,61 @@ pub enum EntityType {
     Hypothesis,
     /// A custom entity type
     Custom(String),
+}
+
+impl TryFrom<String> for EntityType {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("entity type cannot be empty".to_string());
+        }
+
+        let bytes = value.as_bytes();
+        if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"custom:") {
+            let rest = value[7..].trim();
+            if rest.is_empty() {
+                return Err("custom entity type cannot be empty".to_string());
+            }
+            return Ok(Self::Custom(rest.to_string()));
+        }
+
+        Ok(if value.eq_ignore_ascii_case("person") {
+            Self::Person
+        } else if value.eq_ignore_ascii_case("organization") {
+            Self::Organization
+        } else if value.eq_ignore_ascii_case("concept") {
+            Self::Concept
+        } else if value.eq_ignore_ascii_case("event") {
+            Self::Event
+        } else if value.eq_ignore_ascii_case("location") {
+            Self::Location
+        } else if value.eq_ignore_ascii_case("artifact") {
+            Self::Artifact
+        } else if value.eq_ignore_ascii_case("hypothesis") {
+            Self::Hypothesis
+        } else {
+            return Err(format!(
+                "unknown entity type: {value}. Use a built-in type (person, organization, concept, event, location, artifact, hypothesis) or prefix custom types with custom:<name>"
+            ));
+        })
+    }
+}
+
+impl From<EntityType> for String {
+    fn from(value: EntityType) -> Self {
+        match value {
+            EntityType::Person => "person".to_string(),
+            EntityType::Organization => "organization".to_string(),
+            EntityType::Concept => "concept".to_string(),
+            EntityType::Event => "event".to_string(),
+            EntityType::Location => "location".to_string(),
+            EntityType::Artifact => "artifact".to_string(),
+            EntityType::Hypothesis => "hypothesis".to_string(),
+            EntityType::Custom(name) => format!("custom:{name}"),
+        }
+    }
 }
 
 impl fmt::Display for EntityType {
@@ -138,24 +193,33 @@ impl fmt::Display for EntityType {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
-    /// Globally unique identifier
+    /// Globally unique identifier.
     pub id: EntityId,
 
+    /// Primary name for the entity.
     pub canonical_name: String,
 
+    /// Other names this entity is known by.
     #[serde(default)]
     pub aliases: Vec<String>,
 
+    /// The type classification of the entity.
     pub entity_type: EntityType,
 
+    /// When the entity was first created.
     pub created_at: DateTime<Utc>,
+    
+    /// When the entity was last modified.
     pub updated_at: DateTime<Utc>,
 
+    /// Optional embedding for semantic matching.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
 
+    /// Version number (incremented on update).
     pub version: u64,
 
+    /// Arbitrary metadata key-values.
     #[serde(default)]
     pub metadata: serde_json::Value,
 }
@@ -364,5 +428,39 @@ mod tests {
         let deserialized: Entity = serde_json::from_str(&json).unwrap();
         assert_eq!(entity.id, deserialized.id);
         assert_eq!(entity.canonical_name, deserialized.canonical_name);
+    }
+
+    #[test]
+    fn test_entity_type_serde_is_string() {
+        let person = serde_json::to_value(EntityType::Person).unwrap();
+        assert_eq!(person, serde_json::Value::String("person".to_string()));
+
+        let custom = serde_json::to_value(EntityType::Custom("my_type".to_string())).unwrap();
+        assert_eq!(custom, serde_json::Value::String("custom:my_type".to_string()));
+
+        let parsed: EntityType = serde_json::from_str("\"event\"").unwrap();
+        assert_eq!(parsed, EntityType::Event);
+
+        let parsed_case: EntityType = serde_json::from_str("\"Person\"").unwrap();
+        assert_eq!(parsed_case, EntityType::Person);
+
+        let parsed_custom: EntityType = serde_json::from_str("\"custom:weird_vendor_type\"").unwrap();
+        assert_eq!(parsed_custom, EntityType::Custom("weird_vendor_type".to_string()));
+
+        let unknown: Result<EntityType, _> = serde_json::from_str("\"organizaton\"");
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn test_entity_type_custom_builtin_name_roundtrips() {
+        let original = EntityType::Custom("person".to_string());
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(json, "\"custom:person\"");
+
+        let decoded: EntityType = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+
+        let decoded_builtin: EntityType = serde_json::from_str("\"person\"").unwrap();
+        assert_eq!(decoded_builtin, EntityType::Person);
     }
 }

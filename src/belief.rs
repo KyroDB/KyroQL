@@ -15,32 +15,57 @@ use crate::time::TimeRange;
 use crate::value::Value;
 use crate::error::ValidationError;
 
-// BeliefId is defined in confidence module - re-export not needed here
+use crate::conflict::ConflictId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Consistency status of a belief within the knowledge base.
+///
+/// This enum tracks the *consistency* of a belief, not its lifecycle.
+/// Lifecycle states (e.g., supersession) are tracked separately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum ConsistencyStatus {
-    Pending,
-    Consistent,
-    Conflicted,
-    Superseded,
-    Retracted,
+    /// Checked against patterns and other beliefs, passed all checks.
+    Verified,
+    /// Accepted but not yet checked for consistency.
+    Provisional,
+    /// Conflicts with other beliefs or violates patterns.
+    Contested {
+        /// IDs of the conflicts this belief is involved in.
+        conflict_ids: Vec<ConflictId>,
+    },
+}
+
+impl ConsistencyStatus {
+    /// Returns true if this status indicates the belief is contested.
+    #[must_use]
+    pub fn is_contested(&self) -> bool {
+        matches!(self, Self::Contested { .. })
+    }
+
+    /// Returns the conflict IDs if contested, empty slice otherwise.
+    #[must_use]
+    pub fn conflict_ids(&self) -> &[ConflictId] {
+        match self {
+            Self::Contested { conflict_ids } => conflict_ids,
+            _ => &[],
+        }
+    }
 }
 
 impl Default for ConsistencyStatus {
     fn default() -> Self {
-        Self::Pending
+        Self::Provisional
     }
 }
 
 impl fmt::Display for ConsistencyStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Pending => write!(f, "pending"),
-            Self::Consistent => write!(f, "consistent"),
-            Self::Conflicted => write!(f, "conflicted"),
-            Self::Superseded => write!(f, "superseded"),
-            Self::Retracted => write!(f, "retracted"),
+            Self::Verified => write!(f, "verified"),
+            Self::Provisional => write!(f, "provisional"),
+            Self::Contested { conflict_ids } => {
+                write!(f, "contested({} conflicts)", conflict_ids.len())
+            }
         }
     }
 }
@@ -62,7 +87,7 @@ impl fmt::Display for ConsistencyStatus {
 ///     .subject(EntityId::new())
 ///     .predicate("is_superconductor")
 ///     .value(false)
-///     .confidence(Confidence::probability(0.95, "researcher-1").unwrap())
+///     .confidence(Confidence::from_agent(0.95, "researcher-1").unwrap())
 ///     .source(Source::paper("2307.12008", "LK-99 Analysis"))
 ///     .build()
 ///     .unwrap();
@@ -71,60 +96,68 @@ impl fmt::Display for ConsistencyStatus {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Belief {
+    /// Unique identifier for this belief.
     pub id: BeliefId,
+    /// The entity this belief is about.
     pub subject: EntityId,
+    /// The attribute/relationship being asserted.
     pub predicate: String,
+    /// The value being asserted.
     pub value: Value,
+    /// Confidence in this belief.
     pub confidence: Confidence,
+    /// Provenance of this belief.
     pub source: Source,
+    /// When this belief is/was valid in the real world.
     pub valid_time: TimeRange,
-    
     /// When this belief was recorded in the system.
     pub tx_time: DateTime<Utc>,
-
+    /// Current consistency status.
     pub consistency_status: ConsistencyStatus,
-
+    /// ID of the belief this one supersedes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<BeliefId>,
-
+    /// ID of the belief that superseded this one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<BeliefId>,
-
+    /// Optional embedding for semantic search.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
-
-    #[serde(default)]
-    pub metadata: serde_json::Value,
 }
 
 impl Belief {
+    /// Creates a new builder for constructing a Belief.
     pub fn builder() -> BeliefBuilder {
         BeliefBuilder::new()
     }
 
-    /// Returns true if this belief is currently active (not superseded or retracted).
+    /// Returns true if this belief is currently active (not superseded).
     #[must_use]
     pub fn is_active(&self) -> bool {
-        matches!(
-            self.consistency_status,
-            ConsistencyStatus::Pending | ConsistencyStatus::Consistent | ConsistencyStatus::Conflicted
-        ) && self.superseded_by.is_none()
+        self.superseded_by.is_none()
     }
 
+    /// Returns true if this belief is currently active and temporally valid now.
+    #[must_use]
     pub fn is_valid_now(&self) -> bool {
-        self.is_active() && self.valid_time.is_active()
+        let now = Utc::now();
+        self.is_valid_at(now)
     }
 
+    /// Returns true if this belief is currently active and temporally valid at a specific time.
+    #[must_use]
     pub fn is_valid_at(&self, time: DateTime<Utc>) -> bool {
-        self.valid_time.contains(time) && time >= self.tx_time
+        self.is_active() && self.valid_time.contains(time) && time >= self.tx_time
     }
 
+    /// Returns true if superseded.
     pub fn is_superseded(&self) -> bool {
-        self.superseded_by.is_some() || self.consistency_status == ConsistencyStatus::Superseded
+        self.superseded_by.is_some()
     }
 
-    pub fn is_conflicted(&self) -> bool {
-        self.consistency_status == ConsistencyStatus::Conflicted
+    /// Returns true if contested (has conflicts).
+    pub fn is_contested(&self) -> bool {
+        self.consistency_status.is_contested()
     }
 
     /// Returns true if this belief has an embedding.
@@ -141,23 +174,18 @@ impl Belief {
     /// Marks this belief as superseded by another.
     pub fn mark_superseded(&mut self, by: BeliefId) {
         self.superseded_by = Some(by);
-        self.consistency_status = ConsistencyStatus::Superseded;
     }
 
-    /// Marks this belief as conflicted.
-    pub fn mark_conflicted(&mut self) {
-        self.consistency_status = ConsistencyStatus::Conflicted;
+    /// Marks this belief as contested with the given conflicts.
+    pub fn mark_contested(&mut self, conflict_ids: Vec<ConflictId>) {
+        self.consistency_status = ConsistencyStatus::Contested { conflict_ids };
     }
 
-    /// Marks this belief as consistent.
-    pub fn mark_consistent(&mut self) {
-        self.consistency_status = ConsistencyStatus::Consistent;
+    /// Marks this belief as verified (passed all consistency checks).
+    pub fn mark_verified(&mut self) {
+        self.consistency_status = ConsistencyStatus::Verified;
     }
 
-    /// Marks this belief as retracted.
-    pub fn mark_retracted(&mut self) {
-        self.consistency_status = ConsistencyStatus::Retracted;
-    }
 }
 
 impl PartialEq for Belief {
@@ -188,7 +216,6 @@ pub struct BeliefBuilder {
     valid_time: Option<TimeRange>,
     supersedes: Option<BeliefId>,
     embedding: Option<Vec<f32>>,
-    metadata: Option<serde_json::Value>,
 }
 
 impl BeliefBuilder {
@@ -261,13 +288,6 @@ impl BeliefBuilder {
         self
     }
 
-    /// Sets the metadata.
-    #[must_use]
-    pub fn metadata(mut self, metadata: serde_json::Value) -> Self {
-        self.metadata = Some(metadata);
-        self
-    }
-
     /// Builds the Belief.
     /// Returns `ValidationError` if required fields are missing or invalid.
     pub fn build(self) -> Result<Belief, ValidationError> {
@@ -279,7 +299,7 @@ impl BeliefBuilder {
             field: "predicate".to_string(),
         })?;
 
-        if predicate.is_empty() {
+        if predicate.trim().is_empty() {
             return Err(ValidationError::EmptyPredicate);
         }
 
@@ -303,11 +323,10 @@ impl BeliefBuilder {
             source,
             valid_time,
             tx_time: Utc::now(),
-            consistency_status: ConsistencyStatus::Pending,
+            consistency_status: ConsistencyStatus::Provisional,
             supersedes: self.supersedes,
             superseded_by: None,
             embedding: self.embedding,
-            metadata: self.metadata.unwrap_or(serde_json::Value::Null),
         })
     }
 }
@@ -321,7 +340,7 @@ mod tests {
             .subject(EntityId::new())
             .predicate("test_predicate")
             .value(true)
-            .confidence(Confidence::probability(0.9, "test").unwrap())
+            .confidence(Confidence::from_agent(0.9, "test").unwrap())
             .build()
             .unwrap()
     }
@@ -339,7 +358,7 @@ mod tests {
         let result = Belief::builder()
             .predicate("test")
             .value(true)
-            .confidence(Confidence::heuristic(0.5, "test").unwrap())
+            .confidence(Confidence::from_agent(0.5, "test").unwrap())
             .build();
 
         assert!(result.is_err());
@@ -355,7 +374,7 @@ mod tests {
         let result = Belief::builder()
             .subject(EntityId::new())
             .value(true)
-            .confidence(Confidence::heuristic(0.5, "test").unwrap())
+            .confidence(Confidence::from_agent(0.5, "test").unwrap())
             .build();
 
         assert!(result.is_err());
@@ -367,7 +386,19 @@ mod tests {
             .subject(EntityId::new())
             .predicate("")
             .value(true)
-            .confidence(Confidence::heuristic(0.5, "test").unwrap())
+            .confidence(Confidence::from_agent(0.5, "test").unwrap())
+            .build();
+
+        assert!(matches!(result, Err(ValidationError::EmptyPredicate)));
+    }
+
+    #[test]
+    fn test_belief_builder_whitespace_predicate() {
+        let result = Belief::builder()
+            .subject(EntityId::new())
+            .predicate("   ")
+            .value(true)
+            .confidence(Confidence::from_agent(0.5, "test").unwrap())
             .build();
 
         assert!(matches!(result, Err(ValidationError::EmptyPredicate)));
@@ -378,18 +409,16 @@ mod tests {
         let subject = EntityId::new();
         let supersedes = BeliefId::new();
         let embedding = vec![0.1, 0.2, 0.3];
-        let metadata = serde_json::json!({"key": "value"});
 
         let belief = Belief::builder()
             .subject(subject)
             .predicate("test")
             .value(42)
-            .confidence(Confidence::probability(0.9, "agent").unwrap())
+            .confidence(Confidence::from_agent(0.9, "agent").unwrap())
             .source(Source::agent("test-agent", Some("v1")))
             .valid_time(TimeRange::from_now())
             .supersedes(supersedes)
             .embedding(embedding.clone())
-            .metadata(metadata.clone())
             .build()
             .unwrap();
 
@@ -409,28 +438,20 @@ mod tests {
     }
 
     #[test]
-    fn test_belief_mark_conflicted() {
+    fn test_belief_mark_contested() {
         let mut belief = make_test_belief();
-        assert!(!belief.is_conflicted());
+        assert!(!belief.is_contested());
 
-        belief.mark_conflicted();
-        assert!(belief.is_conflicted());
-        assert!(belief.is_active()); // Conflicted beliefs are still active
+        belief.mark_contested(vec![]);
+        assert!(belief.is_contested());
+        assert!(belief.is_active()); // Contested beliefs are still active
     }
 
     #[test]
-    fn test_belief_mark_retracted() {
+    fn test_belief_mark_verified() {
         let mut belief = make_test_belief();
-        belief.mark_retracted();
-        assert!(!belief.is_active());
-        assert_eq!(belief.consistency_status, ConsistencyStatus::Retracted);
-    }
-
-    #[test]
-    fn test_belief_mark_consistent() {
-        let mut belief = make_test_belief();
-        belief.mark_consistent();
-        assert_eq!(belief.consistency_status, ConsistencyStatus::Consistent);
+        belief.mark_verified();
+        assert_eq!(belief.consistency_status, ConsistencyStatus::Verified);
     }
 
     #[test]
@@ -442,12 +463,12 @@ mod tests {
     #[test]
     fn test_belief_equality() {
         let belief1 = make_test_belief();
-        let mut belief2 = Belief::builder()
+        let belief2 = Belief::builder()
             .id(belief1.id)
             .subject(EntityId::new())
             .predicate("different")
             .value("different")
-            .confidence(Confidence::heuristic(0.1, "test").unwrap())
+            .confidence(Confidence::from_agent(0.1, "test").unwrap())
             .build()
             .unwrap();
 
@@ -466,11 +487,31 @@ mod tests {
 
     #[test]
     fn test_consistency_status_display() {
-        assert_eq!(format!("{}", ConsistencyStatus::Pending), "pending");
-        assert_eq!(format!("{}", ConsistencyStatus::Consistent), "consistent");
-        assert_eq!(format!("{}", ConsistencyStatus::Conflicted), "conflicted");
-        assert_eq!(format!("{}", ConsistencyStatus::Superseded), "superseded");
-        assert_eq!(format!("{}", ConsistencyStatus::Retracted), "retracted");
+        assert_eq!(format!("{}", ConsistencyStatus::Verified), "verified");
+        assert_eq!(format!("{}", ConsistencyStatus::Provisional), "provisional");
+        assert_eq!(
+            format!("{}", ConsistencyStatus::Contested { conflict_ids: vec![] }),
+            "contested(0 conflicts)"
+        );
+    }
+
+    #[test]
+    fn test_consistency_status_serde_shape() {
+        let verified = serde_json::to_value(ConsistencyStatus::Verified).unwrap();
+        assert_eq!(verified, serde_json::json!({"status": "verified"}));
+
+        let provisional = serde_json::to_value(ConsistencyStatus::Provisional).unwrap();
+        assert_eq!(provisional, serde_json::json!({"status": "provisional"}));
+
+        let conflict_id = ConflictId::new();
+        let contested = serde_json::to_value(ConsistencyStatus::Contested {
+            conflict_ids: vec![conflict_id],
+        })
+        .unwrap();
+
+        assert_eq!(contested["status"], serde_json::json!("contested"));
+        assert!(contested["conflict_ids"].is_array());
+        assert_eq!(contested["conflict_ids"].as_array().unwrap().len(), 1);
     }
 
     #[test]

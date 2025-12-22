@@ -14,7 +14,8 @@
 //! ## Usage
 //!
 //! ```rust,ignore
-//! use kyroql::{Entity, Belief, Confidence, CalibrationMode};
+//! use kyroql::{Belief, Confidence, Entity, EntityType, TimeRange, Value};
+//! use kyroql::Source;
 //!
 //! // Create an entity
 //! let entity = Entity::new("LK-99", EntityType::Concept);
@@ -23,8 +24,10 @@
 //! let belief = Belief::builder()
 //!     .subject(entity.id)
 //!     .predicate("is_superconductor")
-//!     .value(false)
-//!     .confidence(Confidence::probability(0.99)?)
+//!     .value(Value::Bool(false))
+//!     .confidence(Confidence::from_agent(0.99, "researcher-1")?)
+//!     .source(Source::paper("2308.12345", "LK-99 report"))
+//!     .valid_time(TimeRange::from_now())
 //!     .build()?;
 //! ```
 
@@ -33,25 +36,40 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-pub mod entity;
+// Phase 0: Core types
 pub mod belief;
 pub mod confidence;
-pub mod value;
-pub mod time;
-pub mod source;
 pub mod conflict;
-pub mod pattern;
-pub mod frame;
+pub mod entity;
 pub mod error;
+pub mod frame;
+pub mod pattern;
+pub mod source;
+pub mod time;
+pub mod value;
+
+// Phase 1: IR, Storage, and Operations
+pub mod ir;
+pub mod operations;
+pub mod storage;
 
 // Re-export primary types at crate root for convenience
-pub use entity::{Entity, EntityId, EntityType};
 pub use belief::{Belief, ConsistencyStatus};
-pub use confidence::{Confidence, CalibrationMode, ConfidenceSource, BeliefId};
-pub use value::Value;
-pub use time::TimeRange;
-pub use source::Source;
-pub use conflict::{Conflict, ConflictId, ConflictType, ConflictStatus};
-pub use pattern::{Pattern, PatternId, PatternRule};
-pub use frame::{BeliefFrame, RankedClaim, Evidence, KnowledgeGap, GapType};
+pub use confidence::{BeliefId, CalibrationMode, Confidence, ConfidenceSource, SourceId};
+pub use conflict::{Conflict, ConflictId, ConflictStatus, ConflictType};
+pub use entity::{Entity, EntityId, EntityType};
 pub use error::{KyroError, ValidationError};
+pub use frame::{BeliefFrame, Evidence, GapType, KnowledgeGap, RankedClaim};
+pub use pattern::{Pattern, PatternId, PatternRule};
+pub use source::Source;
+pub use time::TimeRange;
+pub use value::Value;
+
+// Phase 1 re-exports
+pub use ir::{
+	AssertPayload, ConsistencyMode, DefinePatternPayload, KyroIR, Operation, ResolvePayload,
+	RetractPayload,
+};
+pub use operations::{AssertBuilder, ResolveBuilder};
+pub use storage::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
+

@@ -77,7 +77,6 @@ raise NotImplementedError("Python client is not yet shipped in this repo")
 | **4: Monitoring**  | MONITOR, Event streaming            | Weeks 15-17 |
 | **5: Trust**       | Trust model, Meta-cognition         | Weeks 18-20 |
 
-See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for detailed tasks.
 
 ---
 

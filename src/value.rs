@@ -28,49 +28,66 @@ use crate::entity::EntityId;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Value {
+    /// Boolean value.
     Bool(bool),
+    /// 64-bit signed integer.
     Int(i64),
+    /// 64-bit floating point.
     Float(f64),
+    /// UTF-8 string.
     String(String),
+    /// Reference to an entity.
     Entity(EntityId),
+    /// Vector embedding for semantic operations.
     Embedding(Vec<f32>),
+    /// Arbitrary JSON structure.
     Structured(serde_json::Value),
+    /// Explicit null/missing value.
     Null,
 }
 
 impl Value {
+    /// Returns `true` if this is a `Bool` variant.
     pub const fn is_bool(&self) -> bool {
         matches!(self, Self::Bool(_))
     }
 
+    /// Returns `true` if this is an `Int` variant.
     pub const fn is_int(&self) -> bool {
         matches!(self, Self::Int(_))
     }
 
+    /// Returns `true` if this is a `Float` variant.
     pub const fn is_float(&self) -> bool {
         matches!(self, Self::Float(_))
     }
 
+    /// Returns `true` if this is a `String` variant.
     pub const fn is_string(&self) -> bool {
         matches!(self, Self::String(_))
     }
 
+    /// Returns `true` if this is an `Entity` variant.
     pub const fn is_entity(&self) -> bool {
         matches!(self, Self::Entity(_))
     }
 
+    /// Returns `true` if this is an `Embedding` variant.
     pub const fn is_embedding(&self) -> bool {
         matches!(self, Self::Embedding(_))
     }
 
+    /// Returns `true` if this is a `Structured` variant.
     pub const fn is_structured(&self) -> bool {
         matches!(self, Self::Structured(_))
     }
 
+    /// Returns `true` if this is a `Null` variant.
     pub const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
 
+    /// Extracts the boolean value, if present.
     pub const fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(v) => Some(*v),
@@ -78,6 +95,7 @@ impl Value {
         }
     }
 
+    /// Extracts the integer value, if present.
     pub const fn as_int(&self) -> Option<i64> {
         match self {
             Self::Int(v) => Some(*v),
@@ -85,6 +103,7 @@ impl Value {
         }
     }
 
+    /// Extracts the float value, coercing integers if needed.
     pub const fn as_float(&self) -> Option<f64> {
         match self {
             Self::Float(v) => Some(*v),
@@ -93,6 +112,7 @@ impl Value {
         }
     }
 
+    /// Extracts the string reference, if present.
     pub fn as_string(&self) -> Option<&str> {
         match self {
             Self::String(v) => Some(v),
@@ -100,6 +120,7 @@ impl Value {
         }
     }
 
+    /// Extracts the entity ID, if present.
     pub const fn as_entity(&self) -> Option<EntityId> {
         match self {
             Self::Entity(v) => Some(*v),
@@ -107,6 +128,7 @@ impl Value {
         }
     }
 
+    /// Extracts the embedding slice, if present.
     pub fn as_embedding(&self) -> Option<&[f32]> {
         match self {
             Self::Embedding(v) => Some(v),
@@ -114,6 +136,7 @@ impl Value {
         }
     }
 
+    /// Extracts the structured JSON reference, if present.
     pub const fn as_structured(&self) -> Option<&serde_json::Value> {
         match self {
             Self::Structured(v) => Some(v),

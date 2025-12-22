@@ -13,42 +13,59 @@ use crate::confidence::BeliefId;
 /// Validation errors that occur during input validation.
 #[derive(Debug, Error)]
 pub enum ValidationError {
+    /// Confidence value outside [0.0, 1.0].
     #[error("Confidence value {value} is out of range [0.0, 1.0]")]
     ConfidenceOutOfRange {
+        /// The invalid value.
         value: f32,
     },
 
+    /// Time range has start >= end.
     #[error("Invalid time range: from ({from}) must be before to ({to})")]
     InvalidTimeRange {
+        /// Start time.
         from: DateTime<Utc>,
+        /// End time.
         to: DateTime<Utc>,
     },
 
+    /// Entity name is empty.
     #[error("Entity name cannot be empty")]
     EmptyEntityName,
 
+    /// Predicate is empty.
     #[error("Predicate cannot be empty")]
     EmptyPredicate,
 
+    /// Required field missing.
     #[error("Required field '{field}' is missing")]
     MissingField {
+        /// Name of missing field.
         field: String,
     },
 
+    /// Field exceeds length limit.
     #[error("Field '{field}' exceeds maximum length of {max_length}")]
     FieldTooLong {
+        /// Field name.
         field: String,
+        /// Maximum allowed.
         max_length: usize,
     },
 
+    /// Embedding dimension mismatch.
     #[error("Embedding has {actual} dimensions, expected {expected}")]
     InvalidEmbeddingDimension {
+        /// Actual dimension.
         actual: usize,
+        /// Expected dimension.
         expected: usize,
     },
 
+    /// Pattern rule is invalid.
     #[error("Invalid pattern rule: {reason}")]
     InvalidPatternRule {
+        /// Reason for invalidity.
         reason: String,
     },
 }
@@ -56,51 +73,72 @@ pub enum ValidationError {
 /// Execution errors that occur during operation execution.
 #[derive(Debug, Error)]
 pub enum ExecutionError {
+    /// Entity not found in storage.
     #[error("Entity not found: {id}")]
     EntityNotFound {
+        /// Missing entity ID.
         id: EntityId,
     },
 
+    /// Belief not found in storage.
     #[error("Belief not found: {id}")]
     BeliefNotFound {
+        /// Missing belief ID.
         id: BeliefId,
     },
 
+    /// Simulation not found.
     #[error("Simulation not found: {id}")]
     SimulationNotFound {
+        /// Missing simulation ID.
         id: String,
     },
 
+    /// Resource limit exceeded during simulation.
     #[error("Simulation limit exceeded: {limit_type} (max: {max_value}, actual: {actual_value})")]
     SimulationLimitExceeded {
+        /// Type of limit.
         limit_type: String,
+        /// Maximum allowed.
         max_value: u64,
+        /// Actual value.
         actual_value: u64,
     },
 
+    /// Operation timed out.
     #[error("Operation timed out after {duration_ms}ms")]
     Timeout {
+        /// Duration before timeout.
         duration_ms: u64,
     },
 
+    /// Storage backend error.
     #[error("Storage error: {message}")]
     Storage {
+        /// Error details.
         message: String,
     },
 
+    /// Index error.
     #[error("Index error: {message}")]
     Index {
+        /// Error details.
         message: String,
     },
 
+    /// Conflict resolution failed.
     #[error("Conflict resolution failed: {reason}")]
     ConflictResolutionFailed {
+        /// Reason for failure.
         reason: String,
     },
 
+    /// Pattern constraint violated.
     #[error("Pattern '{pattern_name}' was violated: {reason}")]
     PatternViolation {
+        /// Pattern name.
         pattern_name: String,
+        /// Violation reason.
         reason: String,
     },
 }
@@ -108,24 +146,33 @@ pub enum ExecutionError {
 /// Transport errors for client-server communication.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    /// Network connection failed.
     #[error("Connection failed: {message}")]
     ConnectionFailed {
+        /// Error details.
         message: String,
     },
 
+    /// Request serialization failed.
     #[error("Failed to serialize request: {message}")]
     SerializationFailed {
+        /// Error details.
         message: String,
     },
 
+    /// Response deserialization failed.
     #[error("Failed to deserialize response: {message}")]
     DeserializationFailed {
+        /// Error details.
         message: String,
     },
 
+    /// Server returned an error code.
     #[error("Server error (code {code}): {message}")]
     ServerError {
+        /// HTTP/RPC status code.
         code: u32,
+        /// Error message.
         message: String,
     },
 }
@@ -136,17 +183,22 @@ pub enum TransportError {
 /// when using KyroQL.
 #[derive(Debug, Error)]
 pub enum KyroError {
+    /// Input validation failed.
     #[error("Validation error: {0}")]
     Validation(#[from] ValidationError),
 
+    /// Execution failure.
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
 
+    /// Communication failure.
     #[error("Transport error: {0}")]
     Transport(#[from] TransportError),
 
+    /// Internal system error.
     #[error("Internal error: {message}")]
     Internal {
+        /// Error description.
         message: String,
     },
 }
@@ -188,14 +240,14 @@ impl KyroError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            Self::Validation(_) => false, // Validation errors won't change on retry
+            // Validation errors won't change on retry
             Self::Execution(e) => matches!(e, ExecutionError::Timeout { .. }),
             Self::Transport(e) => match e {
                 TransportError::ConnectionFailed { .. } => true,
                 TransportError::ServerError { code, .. } => *code >= 500,
                 _ => false,
             },
-            Self::Internal { .. } => false,
+            Self::Validation(_) | Self::Internal { .. } => false,
         }
     }
 }

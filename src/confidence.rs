@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ValidationError;
 
+/// Unique identifier for a belief.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BeliefId(uuid::Uuid);
@@ -34,6 +35,7 @@ impl fmt::Display for BeliefId {
     }
 }
 
+/// Unique identifier for a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SourceId(uuid::Uuid);
@@ -43,6 +45,12 @@ impl SourceId {
     #[must_use]
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
+    }
+
+    /// Creates a source ID from a UUID.
+    #[must_use]
+    pub fn from_uuid(uuid: uuid::Uuid) -> Self {
+        Self(uuid)
     }
 }
 
@@ -93,25 +101,49 @@ impl fmt::Display for CalibrationMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConfidenceSource {
+    /// Explicitly asserted by an agent.
     AssertedByAgent {
+        /// ID of the agent.
         agent_id: String,
     },
 
+    /// Explicitly asserted by a human user.
+    AssertedByHuman {
+        /// ID of the user.
+        user_id: String,
+    },
+
+    /// Asserted by a physical sensor or device.
+    AssertedBySensor {
+        /// ID of the sensor.
+        sensor_id: String,
+    },
+
+    /// Computed by an AI model.
     ComputedByModel {
+        /// ID of the model (e.g., "gpt-4").
         model_id: String,
+        /// Version of the model.
         model_version: String,
     },
 
+    /// Aggregated from multiple sources.
     AggregatedFromSources {
+        /// IDs of the sources aggregated.
         source_ids: Vec<SourceId>,
+        /// Method used for aggregation (e.g., "weighted_average").
         aggregation_method: String,
     },
 
+    /// Derived from other beliefs.
     DerivedFromPremises {
+        /// IDs of the premise beliefs.
         premise_ids: Vec<BeliefId>,
+        /// Rule used for derivation.
         propagation_rule: String,
     },
 
+    /// Source is unknown.
     Unknown,
 }
 
@@ -132,7 +164,7 @@ impl Default for ConfidenceSource {
 /// use kyroql::{Confidence, CalibrationMode, ConfidenceSource};
 ///
 /// // Create a calibrated probability confidence
-/// let conf = Confidence::probability(0.95, "my-agent").unwrap();
+/// let conf = Confidence::from_agent(0.95, "my-agent").unwrap();
 /// assert_eq!(conf.value(), 0.95);
 /// assert_eq!(conf.calibration, CalibrationMode::Probability);
 /// ```
@@ -173,25 +205,48 @@ impl Confidence {
         })
     }
 
-    /// Creates a calibrated probability confidence asserted by an agent.
-    /// Returns `ValidationError` if value not in [0.0, 1.0].
-    pub fn probability(value: f32, agent_id: impl Into<String>) -> Result<Self, ValidationError> {
-        Self::new(
+    /// Creates a calibrated probability confidence.
+    ///
+    /// This matches the spec: takes a ConfidenceSource directly for full flexibility.
+    pub fn probability(value: f32, source: ConfidenceSource) -> Result<Self, ValidationError> {
+        Self::new(value, CalibrationMode::Probability, source)
+    }
+
+    /// Creates a heuristic (uncalibrated) confidence.
+    ///
+    /// Use sparingly; prefer calibrated probabilities.
+    pub fn heuristic(value: f32, source: ConfidenceSource) -> Result<Self, ValidationError> {
+        Self::new(value, CalibrationMode::Heuristic, source)
+    }
+
+    // --- Ergonomic Helpers (convenience wrappers) ---
+
+    /// Creates a probability confidence asserted by an agent.
+    pub fn from_agent(value: f32, agent_id: impl Into<String>) -> Result<Self, ValidationError> {
+        Self::probability(
             value,
-            CalibrationMode::Probability,
             ConfidenceSource::AssertedByAgent {
                 agent_id: agent_id.into(),
             },
         )
     }
 
-    /// Creates a heuristic confidence.
-    pub fn heuristic(value: f32, agent_id: impl Into<String>) -> Result<Self, ValidationError> {
-        Self::new(
+    /// Creates a probability confidence asserted by a human.
+    pub fn from_human(value: f32, user_id: impl Into<String>) -> Result<Self, ValidationError> {
+        Self::probability(
             value,
-            CalibrationMode::Heuristic,
-            ConfidenceSource::AssertedByAgent {
-                agent_id: agent_id.into(),
+            ConfidenceSource::AssertedByHuman {
+                user_id: user_id.into(),
+            },
+        )
+    }
+
+    /// Creates a probability confidence from a sensor.
+    pub fn from_sensor(value: f32, sensor_id: impl Into<String>) -> Result<Self, ValidationError> {
+        Self::probability(
+            value,
+            ConfidenceSource::AssertedBySensor {
+                sensor_id: sensor_id.into(),
             },
         )
     }
@@ -245,18 +300,22 @@ impl Confidence {
         }
     }
 
+    /// Returns the raw confidence value.
     pub const fn value(&self) -> f32 {
         self.value
     }
 
+    /// Returns true if confidence is high (>= 0.8).
     pub fn is_high(&self) -> bool {
         self.value >= 0.8
     }
 
+    /// Returns true if confidence is medium (>= 0.5 and < 0.8).
     pub fn is_medium(&self) -> bool {
         self.value >= 0.5 && self.value < 0.8
     }
 
+    /// Returns true if confidence is low (< 0.5).
     pub fn is_low(&self) -> bool {
         self.value < 0.5
     }
@@ -337,29 +396,29 @@ mod tests {
 
     #[test]
     fn test_confidence_valid_values() {
-        assert!(Confidence::probability(0.0, "test").is_ok());
-        assert!(Confidence::probability(0.5, "test").is_ok());
-        assert!(Confidence::probability(1.0, "test").is_ok());
+        assert!(Confidence::from_agent(0.0, "test").is_ok());
+        assert!(Confidence::from_agent(0.5, "test").is_ok());
+        assert!(Confidence::from_agent(1.0, "test").is_ok());
     }
 
     #[test]
     fn test_confidence_invalid_values() {
-        assert!(Confidence::probability(-0.1, "test").is_err());
-        assert!(Confidence::probability(1.1, "test").is_err());
-        assert!(Confidence::probability(f32::NAN, "test").is_err());
+        assert!(Confidence::from_agent(-0.1, "test").is_err());
+        assert!(Confidence::from_agent(1.1, "test").is_err());
+        assert!(Confidence::from_agent(f32::NAN, "test").is_err());
     }
 
     #[test]
     fn test_confidence_value_getter() {
-        let conf = Confidence::probability(0.75, "test").unwrap();
+        let conf = Confidence::from_agent(0.75, "test").unwrap();
         assert!((conf.value() - 0.75).abs() < f32::EPSILON);
     }
 
     #[test]
     fn test_confidence_levels() {
-        let high = Confidence::probability(0.9, "test").unwrap();
-        let medium = Confidence::probability(0.6, "test").unwrap();
-        let low = Confidence::probability(0.3, "test").unwrap();
+        let high = Confidence::from_agent(0.9, "test").unwrap();
+        let medium = Confidence::from_agent(0.6, "test").unwrap();
+        let low = Confidence::from_agent(0.3, "test").unwrap();
 
         assert!(high.is_high());
         assert!(!high.is_medium());
@@ -376,8 +435,8 @@ mod tests {
 
     #[test]
     fn test_confidence_is_calibrated() {
-        let calibrated = Confidence::probability(0.8, "test").unwrap();
-        let uncalibrated = Confidence::heuristic(0.8, "test").unwrap();
+        let calibrated = Confidence::from_agent(0.8, "test").unwrap();
+        let uncalibrated = Confidence::heuristic(0.8, ConfidenceSource::AssertedByAgent { agent_id: "test".into() }).unwrap();
 
         assert!(calibrated.is_calibrated());
         assert!(!uncalibrated.is_calibrated());
@@ -385,8 +444,8 @@ mod tests {
 
     #[test]
     fn test_confidence_and() {
-        let a = Confidence::probability(0.8, "test").unwrap();
-        let b = Confidence::probability(0.6, "test").unwrap();
+        let a = Confidence::from_agent(0.8, "test").unwrap();
+        let b = Confidence::from_agent(0.6, "test").unwrap();
         let combined = a.and(&b, None, None);
 
         assert!((combined.value() - 0.6).abs() < f32::EPSILON);
@@ -394,8 +453,8 @@ mod tests {
 
     #[test]
     fn test_confidence_or() {
-        let a = Confidence::probability(0.8, "test").unwrap();
-        let b = Confidence::probability(0.6, "test").unwrap();
+        let a = Confidence::from_agent(0.8, "test").unwrap();
+        let b = Confidence::from_agent(0.6, "test").unwrap();
         let combined = a.or(&b, None, None);
 
         assert!((combined.value() - 0.8).abs() < f32::EPSILON);
@@ -403,8 +462,8 @@ mod tests {
 
     #[test]
     fn test_confidence_and_with_premises() {
-        let a = Confidence::probability(0.8, "test").unwrap();
-        let b = Confidence::probability(0.6, "test").unwrap();
+        let a = Confidence::from_agent(0.8, "test").unwrap();
+        let b = Confidence::from_agent(0.6, "test").unwrap();
         let aid = BeliefId::new();
         let bid = BeliefId::new();
         let combined = a.and(&b, Some(aid), Some(bid));
@@ -444,8 +503,30 @@ mod tests {
     }
 
     #[test]
+    fn test_confidence_human() {
+        let conf = Confidence::from_human(0.99, "expert-1").unwrap();
+        assert_eq!(conf.calibration, CalibrationMode::Probability);
+        if let ConfidenceSource::AssertedByHuman { user_id } = &conf.source {
+            assert_eq!(user_id, "expert-1");
+        } else {
+            panic!("Expected AssertedByHuman");
+        }
+    }
+
+    #[test]
+    fn test_confidence_sensor() {
+        let conf = Confidence::from_sensor(0.95, "temp-sensor-1").unwrap();
+        assert_eq!(conf.calibration, CalibrationMode::Probability);
+        if let ConfidenceSource::AssertedBySensor { sensor_id } = &conf.source {
+            assert_eq!(sensor_id, "temp-sensor-1");
+        } else {
+            panic!("Expected AssertedBySensor");
+        }
+    }
+
+    #[test]
     fn test_confidence_display() {
-        let conf = Confidence::probability(0.85, "test").unwrap();
+        let conf = Confidence::from_agent(0.85, "test").unwrap();
         let display = format!("{conf}");
         assert!(display.contains("0.85"));
         assert!(display.contains("probability"));
@@ -453,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_confidence_serialization() {
-        let conf = Confidence::probability(0.75, "test-agent").unwrap();
+        let conf = Confidence::from_agent(0.75, "test-agent").unwrap();
         let json = serde_json::to_string(&conf).unwrap();
         let deserialized: Confidence = serde_json::from_str(&json).unwrap();
 

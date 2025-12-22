@@ -13,6 +13,7 @@ use crate::confidence::Confidence;
 use crate::entity::EntityType;
 use crate::time::TimeRange;
 
+/// Unique identifier for a pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PatternId(Uuid);
@@ -37,52 +38,81 @@ impl fmt::Display for PatternId {
     }
 }
 
+/// Rules that patterns can enforce.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PatternRule {
+    /// Value must be within a numeric range.
     Range {
+        /// Predicate to check.
         predicate: String,
+        /// Minimum value (inclusive).
         min: Option<f64>,
+        /// Maximum value (inclusive).
         max: Option<f64>,
     },
 
+    /// Only one value allowed per entity.
     Unique {
+        /// Predicate that must be unique.
         predicate: String,
     },
 
+    /// Number of values must be within bounds.
     Cardinality {
+        /// Predicate to check.
         predicate: String,
+        /// Minimum count.
         min: usize,
+        /// Maximum count.
         max: usize,
     },
 
+    /// Value must change monotonically.
     Monotonic {
+        /// Predicate to check.
         predicate: String,
+        /// Required direction.
         direction: MonotonicDirection,
     },
 
+    /// Value must be one of allowed set.
     Enumerated {
+        /// Predicate to check.
         predicate: String,
+        /// Allowed values.
         allowed_values: Vec<String>,
     },
 
+    /// Value must match regex pattern.
     Regex {
+        /// Predicate to check.
         predicate: String,
+        /// Regex pattern.
         pattern: String,
     },
 
+    /// If A is true, B must also be true.
     Implication {
+        /// Antecedent predicate.
         if_predicate: String,
+        /// Consequent predicate.
         then_predicate: String,
     },
 
+    /// Predicates cannot be true simultaneously.
     MutuallyExclusive {
+        /// Conflicting predicates.
         predicates: Vec<String>,
     },
 
+    /// Custom rule with expression.
     Custom {
+        /// Rule name.
         name: String,
+        /// Rule description.
         description: String,
+        /// Optional expression.
         expression: Option<String>,
     },
 }
@@ -226,7 +256,9 @@ impl fmt::Display for PatternRule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MonotonicDirection {
+    /// Values must not decrease (non-strict/weak monotonicity).
     Increasing,
+    /// Values must not increase (non-strict/weak monotonicity).
     Decreasing,
 }
 
@@ -242,21 +274,31 @@ impl fmt::Display for MonotonicDirection {
 /// A pattern (invariant/constraint) that beliefs should satisfy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pattern {
+    /// Unique pattern ID.
     pub id: PatternId,
+    /// Human-readable pattern name.
     pub name: String,
 
+    /// Optional description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Domain entity type this pattern applies to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<EntityType>,
 
+    /// The rule enforced by this pattern.
     pub rule: PatternRule,
+    /// Confidence in the pattern itself.
     pub confidence: Confidence,
+    /// When this pattern is valid.
     pub valid_time: TimeRange,
+    /// Creation timestamp.
     pub created_at: DateTime<Utc>,
+    /// Whether the pattern is currently active.
     pub active: bool,
 
+    /// Metadata.
     #[serde(default)]
     pub metadata: serde_json::Value,
 }
@@ -353,7 +395,7 @@ mod tests {
         let pattern = Pattern::new(
             "temperature_range",
             PatternRule::range("temperature", Some(0.0), Some(100.0)),
-            Confidence::heuristic(0.9, "test").unwrap(),
+            Confidence::from_agent(0.9, "test").unwrap(),
         );
 
         assert_eq!(pattern.name, "temperature_range");
@@ -366,7 +408,7 @@ mod tests {
         let pattern = Pattern::new(
             "test",
             PatternRule::unique("id"),
-            Confidence::heuristic(0.9, "test").unwrap(),
+            Confidence::from_agent(0.9, "test").unwrap(),
         )
         .with_description("Test pattern");
 
@@ -378,7 +420,7 @@ mod tests {
         let pattern = Pattern::new(
             "test",
             PatternRule::unique("id"),
-            Confidence::heuristic(0.9, "test").unwrap(),
+            Confidence::from_agent(0.9, "test").unwrap(),
         )
         .with_domain(EntityType::Person);
 
@@ -390,7 +432,7 @@ mod tests {
         let mut pattern = Pattern::new(
             "test",
             PatternRule::unique("id"),
-            Confidence::heuristic(0.9, "test").unwrap(),
+            Confidence::from_agent(0.9, "test").unwrap(),
         );
 
         assert!(pattern.is_active());
@@ -475,7 +517,7 @@ mod tests {
         let pattern = Pattern::new(
             "test",
             PatternRule::unique("id"),
-            Confidence::heuristic(0.9, "test").unwrap(),
+            Confidence::from_agent(0.9, "test").unwrap(),
         );
 
         let json = serde_json::to_string(&pattern).unwrap();

@@ -16,26 +16,38 @@ use crate::value::Value;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GapType {
+    /// No data exists for the requested predicate.
     NoPredicate {
+        /// The missing predicate.
         predicate: String,
     },
 
+    /// Entity exists but has no beliefs.
     NoBeliefs,
 
+    /// Data exists but confidence is too low.
     LowConfidence {
+        /// Highest confidence found (0-100).
         max_confidence: u8,
     },
 
+    /// Data exists but is outdated.
     Outdated {
+        /// When the most recent data is from.
         most_recent: String,
     },
 
+    /// Unresolved conflicts prevent a clear answer.
     ConflictedWithNoResolution {
+        /// Number of conflicting beliefs.
         conflict_count: usize,
     },
 
+    /// Expected relationship is missing.
     MissingRelationship {
+        /// Expected predicate.
         predicate: String,
+        /// Expected target type.
         target_type: String,
     },
 }
@@ -65,10 +77,14 @@ impl std::fmt::Display for GapType {
 /// A detected knowledge gap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeGap {
+    /// The entity with missing knowledge.
     pub entity_id: EntityId,
+    /// The type of gap.
     pub gap_type: GapType,
+    /// Human-readable description.
     pub description: String,
 
+    /// Optional suggestion for filling the gap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
 }
@@ -111,6 +127,7 @@ impl KnowledgeGap {
     /// Creates a "low confidence" gap.
     #[must_use]
     pub fn low_confidence(entity_id: EntityId, max_confidence: f32) -> Self {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = (max_confidence.clamp(0.0, 1.0) * 100.0) as u8;
         Self::new(
             entity_id,
@@ -125,8 +142,11 @@ impl KnowledgeGap {
 /// A piece of evidence supporting or countering a claim.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
+    /// ID of the belief serving as evidence.
     pub belief_id: BeliefId,
+    /// Value of the belief.
     pub value: Value,
+    /// Confidence of the belief.
     pub confidence: Confidence,
 
     /// Whether this supports (true) or counters (false) the claim.
@@ -135,6 +155,7 @@ pub struct Evidence {
     /// Weight of this evidence in the final answer (0.0 to 1.0).
     pub weight: f32,
 
+    /// Optional explanation of why this evidence is relevant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<String>,
 }
@@ -184,8 +205,11 @@ impl Evidence {
 /// A ranked claim from the evidence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankedClaim {
+    /// The claimed value.
     pub value: Value,
+    /// Derived confidence for this claim.
     pub confidence: Confidence,
+    /// IDs of beliefs supporting this claim.
     pub supporting_belief_ids: Vec<BeliefId>,
     
     /// Rank of this claim (1 = best).
@@ -245,32 +269,40 @@ pub struct QueryAssumptions {
 /// of the information, not just the raw data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BeliefFrame {
+    /// The highest-ranked claim (if any).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_supported_claim: Option<RankedClaim>,
 
+    /// Evidence supporting the claim.
     #[serde(default)]
     pub supporting_evidence: Vec<Evidence>,
 
+    /// Evidence countering the claim.
     #[serde(default)]
     pub counter_evidence: Vec<Evidence>,
 
+    /// Active conflicts affecting this frame.
     #[serde(default)]
     pub conflicts: Vec<ConflictId>,
 
+    /// Identified knowledge gaps.
     #[serde(default)]
     pub gaps: Vec<KnowledgeGap>,
 
+    /// Time window considered.
     pub time_window: TimeRange,
 
+    /// Assumptions made during query processing.
     #[serde(default)]
     pub query_assumptions: QueryAssumptions,
 
-    /// Overall confidence in the answer.
+    /// Overall confidence in the answer (0.0 to 1.0).
     pub epistemic_confidence: f32,
 
-    /// Relevance to the original query.
+    /// Relevance to the original query (0.0 to 1.0).
     pub retrieval_relevance: f32,
 
+    /// Trace of the reasoning process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_trace: Option<String>,
 }
@@ -393,7 +425,7 @@ mod tests {
     fn test_belief_frame_with_answer() {
         let frame = BeliefFrame::with_answer(
             Value::Bool(true),
-            Confidence::probability(0.9, "test").unwrap(),
+            Confidence::from_agent(0.9, "test").unwrap(),
         );
 
         assert!(frame.has_answer());
@@ -417,13 +449,13 @@ mod tests {
         frame.add_supporting_evidence(Evidence::supporting(
             BeliefId::new(),
             Value::Float(25.0),
-            Confidence::probability(0.8, "test").unwrap(),
+            Confidence::from_agent(0.8, "test").unwrap(),
         ));
 
         frame.add_counter_evidence(Evidence::counter(
             BeliefId::new(),
             Value::Float(30.0),
-            Confidence::probability(0.6, "test").unwrap(),
+            Confidence::from_agent(0.6, "test").unwrap(),
         ));
 
         assert_eq!(frame.evidence_count(), 2);
@@ -491,7 +523,7 @@ mod tests {
         let evidence = Evidence::supporting(
             BeliefId::new(),
             Value::Float(25.0),
-            Confidence::probability(0.9, "test").unwrap(),
+            Confidence::from_agent(0.9, "test").unwrap(),
         );
 
         assert!(evidence.supports);
@@ -503,7 +535,7 @@ mod tests {
         let evidence = Evidence::counter(
             BeliefId::new(),
             Value::Float(30.0),
-            Confidence::probability(0.7, "test").unwrap(),
+            Confidence::from_agent(0.7, "test").unwrap(),
         );
 
         assert!(!evidence.supports);
@@ -514,7 +546,7 @@ mod tests {
         let evidence = Evidence::supporting(
             BeliefId::new(),
             Value::Bool(true),
-            Confidence::heuristic(0.5, "test").unwrap(),
+            Confidence::from_agent(0.5, "test").unwrap(),
         )
         .with_weight(0.7);
 
@@ -525,7 +557,7 @@ mod tests {
     fn test_ranked_claim() {
         let claim = RankedClaim::new(
             Value::String("answer".into()),
-            Confidence::probability(0.9, "test").unwrap(),
+            Confidence::from_agent(0.9, "test").unwrap(),
             1,
         )
         .with_supporting(BeliefId::new())
@@ -539,7 +571,7 @@ mod tests {
     fn test_belief_frame_serialization() {
         let frame = BeliefFrame::with_answer(
             Value::Int(42),
-            Confidence::probability(0.9, "test").unwrap(),
+            Confidence::from_agent(0.9, "test").unwrap(),
         );
 
         let json = serde_json::to_string(&frame).unwrap();

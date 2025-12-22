@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::confidence::BeliefId;
 use crate::entity::EntityId;
 
+/// Unique identifier for a conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ConflictId(Uuid);
@@ -37,32 +38,47 @@ impl fmt::Display for ConflictId {
     }
 }
 
+/// The type of conflict between beliefs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictType {
+    /// Same predicate has incompatible values.
     ValueContradiction {
+        /// The predicate with conflicting values.
         predicate: String,
     },
 
+    /// Beliefs have inconsistent temporal relationships.
     TemporalInconsistency {
+        /// Description of the inconsistency.
         reason: String,
     },
 
+    /// Multiple sources disagree.
     SourceDisagreement {
+        /// Number of disagreeing sources.
         source_count: usize,
     },
 
+    /// A defined pattern/constraint was violated.
     PatternViolation {
+        /// ID of the violated pattern.
         pattern_id: String,
+        /// Name of the violated pattern.
         pattern_name: String,
     },
 
+    /// Logical contradiction (e.g., A and not-A).
     LogicalContradiction {
+        /// Type of contradiction.
         contradiction_type: String,
     },
 
+    /// Custom conflict type.
     Custom {
+        /// Name of the custom type.
         name: String,
+        /// Reason for the conflict.
         reason: String,
     },
 }
@@ -126,30 +142,48 @@ impl fmt::Display for ConflictStatus {
     }
 }
 
+/// How a conflict was resolved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ConflictResolution {
+    /// Chose the belief with highest confidence.
     HigherConfidence {
+        /// The winning belief.
         chosen_belief_id: BeliefId,
+        /// Its confidence value.
         confidence: f32,
     },
+    /// Chose the most recently asserted belief.
     MoreRecent {
+        /// The winning belief.
         chosen_belief_id: BeliefId,
     },
+    /// Chose based on source trust hierarchy.
     SourcePriority {
+        /// The winning belief.
         chosen_belief_id: BeliefId,
+        /// Priority rank of the source.
         source_priority: u32,
     },
+    /// Merged beliefs into a consensus.
     Consensus {
+        /// The newly created merged belief.
         merged_belief_id: BeliefId,
     },
+    /// Resolved via human/agent review.
     ManualReview {
+        /// The chosen belief (if any).
         chosen_belief_id: Option<BeliefId>,
+        /// Who performed the review.
         reviewer_id: String,
+        /// Review notes.
         notes: String,
     },
+    /// All conflicting beliefs were retracted.
     AllRetracted,
+    /// Conflict was accepted (coexistence allowed).
     Accepted {
+        /// Reason for acceptance.
         reason: String,
     },
 }
