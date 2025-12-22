@@ -12,16 +12,6 @@ KyroQL is not a query language. It is a **protocol for synchronizing belief stat
 
 ---
 
-## Documentation
-
-| Document                                           | Description                                        |
-| -------------------------------------------------- | -------------------------------------------------- |
-| [VISION.md](./VISION.md)                           | Complete vision, philosophy, and design principles |
-| [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) | Phased implementation roadmap                      |
-| [DATA_MODEL.md](./DATA_MODEL.md)                   | Complete type definitions                          |
-| [ARCHITECTURE.md](./ARCHITECTURE.md)               | System architecture and components                 |
-
----
 
 ## Quick Overview
 
@@ -48,57 +38,30 @@ KyroQL is not a query language. It is a **protocol for synchronizing belief stat
 ### Rust
 
 ```rust
-// ASSERT a belief
-let belief_id = client.assert()
-    .entity(entity_id)
+// NOTE: Networked client APIs (ASSERT/RESOLVE/SIMULATE) are planned.
+// Today, this crate provides the core data model + validation.
+
+use kyroql::{Belief, Confidence, Entity, EntityType, Source, TimeRange, Value};
+
+let entity = Entity::new("LK-99", EntityType::Concept);
+let belief = Belief::builder()
+    .subject(entity.id)
     .predicate("is_superconductor")
-    .value(false)
-    .confidence(Confidence::probability(0.99, source))
-    .source(Source::Paper { arxiv_id: "2308.12345" })
+    .value(Value::Bool(false))
+    .confidence(Confidence::probability(0.99, "researcher-1")?)
+    .source(Source::paper("2308.12345", "LK-99 report"))
     .valid_time(TimeRange::from_now())
-    .execute()
-    .await?;
+    .build()?;
 
-// RESOLVE a question
-let frame = client.resolve()
-    .question("Is LK-99 a superconductor?")
-    .min_confidence(0.5)
-    .conflict_policy(ConflictResolutionPolicy::HighestConfidence)
-    .execute()
-    .await?;
-
-// The response is structured, not prose
-println!("Answer: {:?}", frame.best_supported_claim);
-println!("Confidence: {}", frame.epistemic_confidence);
-println!("Gaps: {:?}", frame.gaps);
-
-// SIMULATE a counterfactual
-let sim = client.simulate().execute().await?;
-sim.assert_hypothetical(hypothesis)?;
-let impact = sim.query_impact().execute().await?;
-drop(sim); // Reality unchanged
+println!("belief: {}", belief.id);
 ```
 
 ### Python
 
+> Python client APIs are planned; the current repository ships a Rust crate.
+
 ```python
-# ASSERT a belief
-belief_id = await client.assert_(
-    entity=entity_id,
-    predicate="is_superconductor",
-    value=False,
-    confidence=Confidence.probability(0.99),
-    source=Source.paper(arxiv_id="2308.12345"),
-)
-
-# RESOLVE a question
-frame = await client.resolve(
-    question="Is LK-99 a superconductor?",
-    min_confidence=0.5,
-)
-
-print(f"Answer: {frame.best_supported_claim}")
-print(f"Gaps: {frame.gaps}")
+raise NotImplementedError("Python client is not yet shipped in this repo")
 ```
 
 ---
@@ -114,7 +77,7 @@ print(f"Gaps: {frame.gaps}")
 | **4: Monitoring**  | MONITOR, Event streaming            | Weeks 15-17 |
 | **5: Trust**       | Trust model, Meta-cognition         | Weeks 18-20 |
 
-See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for detailed tasks.
+See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for detailed tasks.
 
 ---
 
@@ -155,7 +118,7 @@ See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for detailed tasks.
 
 ## Status
 
-🚧 **Design Phase** - Documentation complete, implementation starting
+**Active Development** - Core data model is implemented; client/server protocol APIs are planned.
 
 ---
 

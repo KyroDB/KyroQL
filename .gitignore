@@ -1,2 +1,14 @@
 /docs
 /other_docs
+/*.log
+/temp   
+/cache
+*.tmp
+.DS_Store
+/node_modules
+/build
+/dist
+/.env
+/.vscode
+/.idea
+/.github/copilot-instructions.md
