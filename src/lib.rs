@@ -47,6 +47,7 @@ pub mod pattern;
 pub mod source;
 pub mod time;
 pub mod value;
+pub mod inference; // Exposing the inference module
 
 // Phase 1: execution engine
 pub mod engine;
@@ -81,4 +82,5 @@ pub use storage::{
 };
 
 pub use engine::{EngineResponse, KyroEngine};
+pub use inference::ConflictResolutionPolicy; // Exposing ConflictResolutionPolicy from inference module
 

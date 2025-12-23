@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::confidence::{BeliefId, Confidence};
 use crate::entity::EntityId;
+use crate::inference::ConflictResolutionPolicy;
 use crate::pattern::PatternRule;
 use crate::source::Source;
 use crate::time::TimeRange;
@@ -136,6 +137,12 @@ pub struct ResolvePayload {
     /// Whether to include knowledge gaps in the response.
     #[serde(default = "default_true")]
     pub include_gaps: bool,
+
+    /// Policy for resolving conflicts when multiple competing beliefs exist.
+    ///
+    /// If not provided, the engine uses its default policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_policy: Option<ConflictResolutionPolicy>,
 }
 
 fn default_limit() -> usize {
@@ -157,6 +164,7 @@ impl Default for ResolvePayload {
             limit: default_limit(),
             include_counter_evidence: false,
             include_gaps: true,
+            conflict_policy: None,
         }
     }
 }
@@ -268,6 +276,7 @@ mod tests {
             limit: 5,
             include_counter_evidence: true,
             include_gaps: true,
+            conflict_policy: None,
         };
 
         let json = serde_json::to_string(&payload).unwrap();

@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 
 use crate::entity::EntityId;
 use crate::error::ValidationError;
+use crate::inference::ConflictResolutionPolicy;
 use crate::ir::{KyroIR, Operation, ResolvePayload};
 
 /// Builder for RESOLVE operations.
@@ -30,6 +31,7 @@ pub struct ResolveBuilder {
     limit: Option<usize>,
     include_counter_evidence: bool,
     include_gaps: bool,
+    conflict_policy: Option<ConflictResolutionPolicy>,
 }
 
 impl Default for ResolveBuilder {
@@ -43,6 +45,7 @@ impl Default for ResolveBuilder {
             limit: None,
             include_counter_evidence: false,
             include_gaps: true,
+            conflict_policy: None,
         }
     }
 }
@@ -109,6 +112,13 @@ impl ResolveBuilder {
         self
     }
 
+    /// Select how RESOLVE should handle competing beliefs.
+    #[must_use]
+    pub fn conflict_policy(mut self, policy: ConflictResolutionPolicy) -> Self {
+        self.conflict_policy = Some(policy);
+        self
+    }
+
     /// Build the RESOLVE IR.
     ///
     /// Returns `ValidationError` if:
@@ -138,6 +148,7 @@ impl ResolveBuilder {
             limit: self.limit.unwrap_or(10),
             include_counter_evidence: self.include_counter_evidence,
             include_gaps: self.include_gaps,
+            conflict_policy: self.conflict_policy,
         };
 
         Ok(KyroIR::new(Operation::Resolve(payload)))
@@ -147,6 +158,7 @@ impl ResolveBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::confidence::SourceId;
 
     #[test]
     fn test_query_only() {
@@ -264,6 +276,25 @@ mod tests {
         } else {
             panic!("Expected Resolve operation");
         }
+    }
+
+    #[test]
+    fn test_conflict_policy_plumbed() {
+        let sid = SourceId::new();
+        let ir = ResolveBuilder::new()
+            .query("test")
+            .conflict_policy(ConflictResolutionPolicy::source_priority(vec![sid]).unwrap())
+            .build()
+            .unwrap();
+
+        let Operation::Resolve(payload) = ir.operation else {
+            panic!("Expected Resolve operation");
+        };
+
+        assert!(matches!(
+            payload.conflict_policy,
+            Some(ConflictResolutionPolicy::SourcePriority { .. })
+        ));
     }
 
     #[test]

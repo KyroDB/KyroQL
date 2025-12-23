@@ -15,6 +15,7 @@ use crate::conflict::{Conflict, ConflictId};
 use crate::entity::{EntityId};
 use crate::error::{ExecutionError, KyroError, KyroResult, ValidationError};
 use crate::frame::{BeliefFrame, Evidence, KnowledgeGap, RankedClaim};
+use crate::inference::{apply_conflict_policy, ConflictResolutionPolicy, PolicyDecision};
 use crate::ir::{ConsistencyMode, DefinePatternPayload, KyroIR, Operation, ResolvePayload, RetractPayload};
 use crate::pattern::{Pattern, PatternId, PatternRule};
 use crate::storage::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
@@ -284,20 +285,76 @@ impl KyroEngine {
     }
 
     fn execute_resolve(&self, payload: ResolvePayload) -> KyroResult<EngineResponse> {
-        let entity_id = payload.entity_id.ok_or_else(|| {
-            KyroError::Execution(ExecutionError::Index {
-                message: "resolve currently requires entity_id".to_string(),
-            })
-        })?;
-        let predicate = payload.predicate.as_deref().ok_or_else(|| {
-            KyroError::Execution(ExecutionError::Index {
-                message: "resolve currently requires predicate".to_string(),
-            })
-        })?;
+        let as_of = payload.as_of.unwrap_or_else(Utc::now);
+        let min_conf = payload.min_confidence.unwrap_or(0.0).clamp(0.0, 1.0);
+
+        // Conservative entity resolution from query.
+        // We only auto-resolve if:
+        // - entity_id was not provided
+        // - query looks like an entity name (short, no '?')
+        // - fuzzy search yields exactly one candidate
+        let mut entity_id = payload.entity_id;
+        if entity_id.is_none() {
+            if let Some(q) = payload.query.as_deref() {
+                let q = q.trim();
+                let looks_like_name = !q.is_empty()
+                    && q.len() <= 80
+                    && !q.contains('?')
+                    && q.split_whitespace().count() <= 6;
+                if looks_like_name {
+                    let candidates = self
+                        .entities
+                        .find_by_name_fuzzy(q, 2)
+                        .map_err(Self::storage_err)?;
+                    if candidates.len() == 1 {
+                        entity_id = Some(candidates[0].id);
+                    }
+                }
+            }
+        }
+
+        let predicate = payload.predicate.as_deref().map(str::trim).filter(|p| !p.is_empty());
+
+        let mut frame = BeliefFrame::empty();
+        frame.time_window = TimeRange::instant(as_of);
+        frame.query_assumptions.assumed_time = Some(as_of);
+        frame.query_assumptions.resolved_entity = entity_id;
+
+        // If we cannot resolve the entity, we cannot query stores meaningfully.
+        let Some(entity_id) = entity_id else {
+            if payload.include_gaps {
+                frame.gaps.push(KnowledgeGap::missing_entity());
+            }
+            frame.reasoning_trace = Some(
+                "resolve requires an entity_id (or a query that resolves to exactly one entity)".to_string(),
+            );
+            return Ok(EngineResponse::Resolve { frame });
+        };
 
         self.ensure_entity_exists(entity_id)?;
 
-        let as_of = payload.as_of.unwrap_or_else(Utc::now);
+        // If predicate is missing, return a structured gap rather than hard error.
+        let Some(predicate) = predicate else {
+            if payload.include_gaps {
+                // If the entity has no beliefs at all, report that; otherwise we still need a predicate.
+                let count = self.beliefs.count_by_entity(entity_id).map_err(Self::storage_err)?;
+                if count == 0 {
+                    frame.gaps.push(KnowledgeGap::new(
+                        entity_id,
+                        crate::frame::GapType::NoBeliefs,
+                        "Entity has no beliefs to resolve",
+                    ));
+                } else {
+                    frame.gaps.push(KnowledgeGap::missing_predicate(entity_id));
+                }
+            }
+
+            frame.reasoning_trace = Some(
+                "resolve requires a predicate when using the current storage APIs".to_string(),
+            );
+            return Ok(EngineResponse::Resolve { frame });
+        };
+
         let all = self
             .beliefs
             .find_as_of(entity_id, predicate, as_of)
@@ -307,8 +364,6 @@ impl KyroEngine {
             .iter()
             .map(|b| b.confidence.value())
             .fold(0.0f32, f32::max);
-
-        let min_conf = payload.min_confidence.unwrap_or(0.0).clamp(0.0, 1.0);
         let mut beliefs: Vec<Belief> = all
             .into_iter()
             .filter(|b| b.confidence.value() >= min_conf)
@@ -316,11 +371,6 @@ impl KyroEngine {
 
         beliefs.sort_by(|a, b| b.confidence.value().total_cmp(&a.confidence.value()));
         beliefs.truncate(payload.limit);
-
-        let mut frame = BeliefFrame::empty();
-        frame.time_window = TimeRange::instant(as_of);
-        frame.query_assumptions.assumed_time = Some(as_of);
-        frame.query_assumptions.resolved_entity = Some(entity_id);
 
         if beliefs.is_empty() {
             if payload.include_gaps {
@@ -333,14 +383,59 @@ impl KyroEngine {
             return Ok(EngineResponse::Resolve { frame });
         }
 
-        let best = &beliefs[0];
-        frame.epistemic_confidence = best.confidence.value();
+        // Resolve competing beliefs if necessary.
+        let policy = payload
+            .conflict_policy
+            .unwrap_or_else(ConflictResolutionPolicy::default);
+        frame.query_assumptions.trust_model = Some(policy.name().to_string());
+
+        // Detect whether we have multiple distinct values.
+        // `Value` is not Hash/Eq, so compute uniqueness via equality.
+        let mut distinct_values: Vec<Value> = Vec::new();
+        for b in &beliefs {
+            if !distinct_values.iter().any(|v| v == &b.value) {
+                distinct_values.push(b.value.clone());
+            }
+        }
+
+        let (winner_id, decision) = if distinct_values.len() <= 1 {
+            // No conflict; treat the best-ranked belief as selected.
+            (beliefs[0].id, PolicyDecision::Selected(beliefs[0].id))
+        } else {
+            let decision = apply_conflict_policy(&policy, &beliefs);
+            match decision {
+                PolicyDecision::Selected(id) => (id, decision),
+                PolicyDecision::Unresolved => {
+                    if payload.include_gaps {
+                        frame.gaps.push(KnowledgeGap::new(
+                            entity_id,
+                            crate::frame::GapType::ConflictedWithNoResolution {
+                                conflict_count: distinct_values.len(),
+                            },
+                            "Competing beliefs exist; no resolution policy selected",
+                        ));
+                    }
+                    frame.reasoning_trace = Some(
+                        "multiple competing beliefs found and conflict policy did not select a winner".to_string(),
+                    );
+                    // Still attach evidence + conflicts, but omit best_supported_claim.
+                    (beliefs[0].id, decision)
+                }
+            }
+        };
+
+        let winner = beliefs
+            .iter()
+            .find(|b| b.id == winner_id)
+            .unwrap_or(&beliefs[0]);
+
+        frame.epistemic_confidence = winner.confidence.value();
         frame.retrieval_relevance = 1.0;
 
-        let mut claim = RankedClaim::new(best.value.clone(), best.confidence.clone(), 1);
+        let mut claim = RankedClaim::new(winner.value.clone(), winner.confidence.clone(), 1);
 
         for b in &beliefs {
-            if b.value == best.value {
+            if b.value == winner.value {
                 claim.supporting_belief_ids.push(b.id);
                 frame.supporting_evidence.push(Evidence::supporting(
                     b.id,
@@ -367,7 +462,10 @@ impl KyroEngine {
             }
         }
 
-        frame.best_supported_claim = Some(claim);
+        // Only set the answer if the policy selected a winner (or there was no conflict).
+        if distinct_values.len() <= 1 || !matches!(decision, PolicyDecision::Unresolved) {
+            frame.best_supported_claim = Some(claim);
+        }
 
         Ok(EngineResponse::Resolve { frame })
     }
@@ -622,6 +720,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::entity::{Entity, EntityType};
+    use crate::inference::ConflictResolutionPolicy;
+    use crate::ir::AssertPayload;
     use crate::source::Source;
     use crate::storage::memory::InMemoryStores;
 
@@ -1006,5 +1106,106 @@ mod tests {
             panic!("expected resolve");
         };
         assert_eq!(frame.best_supported_claim.unwrap().value, Value::Null);
+    }
+
+    #[test]
+    fn resolve_explicit_conflict_omits_answer() {
+        let (eng, id) = engine();
+
+        eng.execute(KyroIR::new(Operation::Assert(AssertPayload {
+            entity_id: id,
+            predicate: "status".to_string(),
+            value: Value::String("on".to_string()),
+            confidence: Confidence::from_agent(0.7, "a").unwrap(),
+            source: Source::agent("a", Option::<String>::None),
+            valid_time: TimeRange::forever(),
+            consistency_mode: ConsistencyMode::Eventual,
+            embedding: None,
+        })))
+        .unwrap();
+
+        eng.execute(KyroIR::new(Operation::Assert(AssertPayload {
+            entity_id: id,
+            predicate: "status".to_string(),
+            value: Value::String("off".to_string()),
+            confidence: Confidence::from_agent(0.8, "b").unwrap(),
+            source: Source::agent("b", Option::<String>::None),
+            valid_time: TimeRange::forever(),
+            consistency_mode: ConsistencyMode::Eventual,
+            embedding: None,
+        })))
+        .unwrap();
+
+        let resolve = KyroIR::new(Operation::Resolve(ResolvePayload {
+            entity_id: Some(id),
+            predicate: Some("status".to_string()),
+            conflict_policy: Some(ConflictResolutionPolicy::ExplicitConflict),
+            ..ResolvePayload::default()
+        }));
+
+        let EngineResponse::Resolve { frame } = eng.execute(resolve).unwrap() else {
+            panic!("expected resolve");
+        };
+
+        assert!(frame.best_supported_claim.is_none());
+        assert!(frame.has_conflicts());
+        assert!(frame.has_gaps());
+        assert_eq!(frame.query_assumptions.trust_model.as_deref(), Some("explicit_conflict"));
+    }
+
+    #[test]
+    fn resolve_latest_wins_selects_newest_tx_time() {
+        let (eng, id, belief_store) = engine_with_backing_stores();
+
+        let t0 = Utc::now();
+        let old = Belief {
+            id: BeliefId::new(),
+            subject: id,
+            predicate: "status".to_string(),
+            value: Value::String("old".to_string()),
+            confidence: Confidence::from_agent(0.9, "a").unwrap(),
+            source: Source::agent("a", Option::<String>::None),
+            valid_time: TimeRange::forever(),
+            tx_time: t0,
+            reason: None,
+            consistency_status: ConsistencyStatus::Verified,
+            supersedes: None,
+            superseded_by: None,
+            embedding: None,
+        };
+
+        let new = Belief {
+            id: BeliefId::new(),
+            subject: id,
+            predicate: "status".to_string(),
+            value: Value::String("new".to_string()),
+            confidence: Confidence::from_agent(0.1, "b").unwrap(),
+            source: Source::agent("b", Option::<String>::None),
+            valid_time: TimeRange::forever(),
+            tx_time: t0 + chrono::Duration::seconds(5),
+            reason: None,
+            consistency_status: ConsistencyStatus::Verified,
+            supersedes: None,
+            superseded_by: None,
+            embedding: None,
+        };
+
+        belief_store.insert(old).unwrap();
+        belief_store.insert(new).unwrap();
+
+        let resolve = KyroIR::new(Operation::Resolve(ResolvePayload {
+            entity_id: Some(id),
+            predicate: Some("status".to_string()),
+            as_of: Some(t0 + chrono::Duration::seconds(10)),
+            conflict_policy: Some(ConflictResolutionPolicy::LatestWins),
+            ..ResolvePayload::default()
+        }));
+
+        let EngineResponse::Resolve { frame } = eng.execute(resolve).unwrap() else {
+            panic!("expected resolve");
+        };
+
+        assert_eq!(frame.best_supported_claim.unwrap().value, Value::String("new".to_string()));
+        assert_eq!(frame.query_assumptions.trust_model.as_deref(), Some("latest_wins"));
     }
 }

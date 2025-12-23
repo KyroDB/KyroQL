@@ -16,6 +16,12 @@ use crate::value::Value;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GapType {
+    /// RESOLVE could not determine which entity the query refers to.
+    MissingEntity,
+
+    /// RESOLVE needs a predicate/attribute to answer.
+    MissingPredicate,
+
     /// No data exists for the requested predicate.
     NoPredicate {
         /// The missing predicate.
@@ -55,6 +61,8 @@ pub enum GapType {
 impl std::fmt::Display for GapType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingEntity => write!(f, "missing entity"),
+            Self::MissingPredicate => write!(f, "missing predicate"),
             Self::NoPredicate { predicate } => write!(f, "no data for '{predicate}'"),
             Self::NoBeliefs => write!(f, "entity has no beliefs"),
             Self::LowConfidence { max_confidence } => {
@@ -77,8 +85,9 @@ impl std::fmt::Display for GapType {
 /// A detected knowledge gap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeGap {
-    /// The entity with missing knowledge.
-    pub entity_id: EntityId,
+    /// The entity with missing knowledge (if known).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<EntityId>,
     /// The type of gap.
     pub gap_type: GapType,
     /// Human-readable description.
@@ -94,7 +103,18 @@ impl KnowledgeGap {
     #[must_use]
     pub fn new(entity_id: EntityId, gap_type: GapType, description: impl Into<String>) -> Self {
         Self {
-            entity_id,
+            entity_id: Some(entity_id),
+            gap_type,
+            description: description.into(),
+            suggestion: None,
+        }
+    }
+
+    /// Creates a new knowledge gap without a resolved entity.
+    #[must_use]
+    pub fn new_without_entity(gap_type: GapType, description: impl Into<String>) -> Self {
+        Self {
+            entity_id: None,
             gap_type,
             description: description.into(),
             suggestion: None,
@@ -135,6 +155,25 @@ impl KnowledgeGap {
                 max_confidence: pct,
             },
             format!("Data exists but confidence is low ({pct}%)"),
+        )
+    }
+
+    /// Creates a "missing entity" gap.
+    #[must_use]
+    pub fn missing_entity() -> Self {
+        Self::new_without_entity(
+            GapType::MissingEntity,
+            "Unable to resolve which entity this query refers to",
+        )
+    }
+
+    /// Creates a "missing predicate" gap.
+    #[must_use]
+    pub fn missing_predicate(entity_id: EntityId) -> Self {
+        Self::new(
+            entity_id,
+            GapType::MissingPredicate,
+            "A predicate/attribute is required to answer this query",
         )
     }
 }
@@ -440,6 +479,7 @@ mod tests {
         assert!(!frame.has_answer());
         assert!(frame.has_gaps());
         assert_eq!(frame.gaps.len(), 1);
+        assert_eq!(frame.gaps[0].entity_id, Some(entity));
     }
 
     #[test]

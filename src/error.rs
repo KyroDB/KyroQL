@@ -68,6 +68,13 @@ pub enum ValidationError {
         /// Reason for invalidity.
         reason: String,
     },
+
+    /// Conflict resolution policy is invalid.
+    #[error("Invalid conflict resolution policy: {reason}")]
+    InvalidConflictResolutionPolicy {
+        /// Reason for invalidity.
+        reason: String,
+    },
 }
 
 /// Execution errors that occur during operation execution.
