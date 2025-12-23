@@ -133,6 +133,13 @@ pub enum ExecutionError {
         reason: String,
     },
 
+    /// Conflicts were detected that prevent the operation.
+    #[error("Conflicts detected: {conflicts:?}")]
+    ConflictsDetected {
+        /// Human-readable conflict descriptors.
+        conflicts: Vec<String>,
+    },
+
     /// Pattern constraint violated.
     #[error("Pattern '{pattern_name}' was violated: {reason}")]
     PatternViolation {

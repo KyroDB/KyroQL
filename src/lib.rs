@@ -48,6 +48,9 @@ pub mod source;
 pub mod time;
 pub mod value;
 
+// Phase 1: execution engine
+pub mod engine;
+
 // Phase 1: IR, Storage, and Operations
 pub mod ir;
 pub mod operations;
@@ -72,4 +75,10 @@ pub use ir::{
 };
 pub use operations::{AssertBuilder, ResolveBuilder};
 pub use storage::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
+pub use storage::{
+	InMemoryBeliefStore, InMemoryConflictStore, InMemoryEntityStore, InMemoryPatternStore,
+	InMemoryStores,
+};
+
+pub use engine::{EngineResponse, KyroEngine};
 

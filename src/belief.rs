@@ -112,6 +112,10 @@ pub struct Belief {
     pub valid_time: TimeRange,
     /// When this belief was recorded in the system.
     pub tx_time: DateTime<Utc>,
+
+    /// Optional audit reason (e.g., retraction reason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Current consistency status.
     pub consistency_status: ConsistencyStatus,
     /// ID of the belief this one supersedes.
@@ -138,16 +142,21 @@ impl Belief {
     }
 
     /// Returns true if this belief is currently active and temporally valid now.
+    ///
+    /// This is the "currently usable" predicate: it includes supersession status.
     #[must_use]
     pub fn is_valid_now(&self) -> bool {
         let now = Utc::now();
-        self.is_valid_at(now)
+        self.is_active() && self.is_valid_at(now)
     }
 
-    /// Returns true if this belief is currently active and temporally valid at a specific time.
+    /// Returns true if this belief was temporally valid at a specific time.
+    ///
+    /// Note: This does not account for supersession. For "currently usable" checks,
+    /// use [`Belief::is_valid_now`] or combine this with [`Belief::is_active`].
     #[must_use]
     pub fn is_valid_at(&self, time: DateTime<Utc>) -> bool {
-        self.is_active() && self.valid_time.contains(time) && time >= self.tx_time
+        self.valid_time.contains(time) && time >= self.tx_time
     }
 
     /// Returns true if superseded.
@@ -215,6 +224,7 @@ pub struct BeliefBuilder {
     source: Option<Source>,
     valid_time: Option<TimeRange>,
     supersedes: Option<BeliefId>,
+    reason: Option<String>,
     embedding: Option<Vec<f32>>,
 }
 
@@ -274,6 +284,13 @@ impl BeliefBuilder {
         self
     }
 
+    /// Sets an optional audit reason.
+    #[must_use]
+    pub fn reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
     /// Sets the belief this one supersedes.
     #[must_use]
     pub fn supersedes(mut self, supersedes: BeliefId) -> Self {
@@ -323,6 +340,7 @@ impl BeliefBuilder {
             source,
             valid_time,
             tx_time: Utc::now(),
+            reason: self.reason,
             consistency_status: ConsistencyStatus::Provisional,
             supersedes: self.supersedes,
             superseded_by: None,

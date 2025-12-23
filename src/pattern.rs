@@ -215,6 +215,30 @@ impl PatternRule {
             Self::Custom { .. } => None,
         }
     }
+
+    /// Returns all predicates this rule should be indexed under for lookup.
+    ///
+    /// This is used by storage backends to support `PatternStore::find_by_predicate`.
+    ///
+    /// For rules spanning multiple predicates (e.g., `MutuallyExclusive`), indexing only a
+    /// single "primary" predicate would cause missed validations.
+    #[must_use]
+    pub fn indexed_predicates(&self) -> Vec<&str> {
+        match self {
+            Self::Range { predicate, .. }
+            | Self::Unique { predicate }
+            | Self::Cardinality { predicate, .. }
+            | Self::Monotonic { predicate, .. }
+            | Self::Enumerated { predicate, .. }
+            | Self::Regex { predicate, .. } => vec![predicate.as_str()],
+            Self::Implication {
+                if_predicate,
+                then_predicate,
+            } => vec![if_predicate.as_str(), then_predicate.as_str()],
+            Self::MutuallyExclusive { predicates } => predicates.iter().map(String::as_str).collect(),
+            Self::Custom { .. } => Vec::new(),
+        }
+    }
 }
 
 impl fmt::Display for PatternRule {

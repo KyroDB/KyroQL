@@ -4,5 +4,11 @@
 //! Implementations will be provided in separate modules.
 
 mod traits;
+pub mod memory;
 
 pub use traits::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
+
+pub use memory::{
+	InMemoryBeliefStore, InMemoryConflictStore, InMemoryEntityStore, InMemoryPatternStore,
+	InMemoryStores,
+};
