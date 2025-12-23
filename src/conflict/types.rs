@@ -318,6 +318,7 @@ impl Conflict {
     }
 
     /// Sets the severity.
+    #[must_use]
     pub fn with_severity(mut self, severity: f32) -> Self {
         self.severity = severity.clamp(0.0, 1.0);
         self

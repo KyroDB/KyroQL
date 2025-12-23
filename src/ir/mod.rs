@@ -8,8 +8,14 @@
 
 mod consistency;
 mod operations;
+mod serialization;
+mod validation;
 
 pub use consistency::ConsistencyMode;
 pub use operations::{
-    AssertPayload, DefinePatternPayload, KyroIR, Operation, ResolvePayload, RetractPayload,
+    AssertPayload, DefinePatternPayload, DerivePayload, KyroIR, MonitorPayload, Operation,
+    ResolvePayload, RetractPayload, SimulatePayload,
 };
+
+pub use serialization::{from_json, to_json_pretty};
+pub use validation::{MAX_EMBEDDING_DIM, MAX_TEXT_LEN};

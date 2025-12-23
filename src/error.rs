@@ -119,6 +119,13 @@ pub enum ExecutionError {
         duration_ms: u64,
     },
 
+    /// Operation is recognized but not implemented in the current build.
+    #[error("Operation not implemented: {operation}")]
+    NotImplemented {
+        /// Operation name.
+        operation: String,
+    },
+
     /// Storage backend error.
     #[error("Storage error: {message}")]
     Storage {

@@ -24,6 +24,7 @@ use crate::ir::{KyroIR, Operation, ResolvePayload};
 #[derive(Debug, Clone)]
 pub struct ResolveBuilder {
     query: Option<String>,
+    query_embedding: Option<Vec<f32>>,
     entity_id: Option<EntityId>,
     predicate: Option<String>,
     as_of: Option<DateTime<Utc>>,
@@ -38,6 +39,7 @@ impl Default for ResolveBuilder {
     fn default() -> Self {
         Self {
             query: None,
+            query_embedding: None,
             entity_id: None,
             predicate: None,
             as_of: None,
@@ -60,6 +62,13 @@ impl ResolveBuilder {
     #[must_use]
     pub fn query(mut self, query: impl Into<String>) -> Self {
         self.query = Some(query.into());
+        self
+    }
+
+    /// Provide a pre-computed query embedding for semantic RESOLVE.
+    #[must_use]
+    pub fn query_embedding(mut self, embedding: Vec<f32>) -> Self {
+        self.query_embedding = Some(embedding);
         self
     }
 
@@ -126,9 +135,14 @@ impl ResolveBuilder {
     /// - min_confidence is out of range [0.0, 1.0]
     pub fn build(self) -> Result<KyroIR, ValidationError> {
         // At least one filter must be specified
-        if self.query.is_none() && self.entity_id.is_none() && self.predicate.is_none() {
+        if self.query.is_none()
+            && self.query_embedding.is_none()
+            && self.entity_id.is_none()
+            && self.predicate.is_none()
+        {
             return Err(ValidationError::MissingField {
-                field: "query, entity_id, or predicate (at least one required)".to_string(),
+                field: "query, query_embedding, entity_id, or predicate (at least one required)"
+                    .to_string(),
             });
         }
 
@@ -139,8 +153,16 @@ impl ResolveBuilder {
             }
         }
 
+        // If the caller provided a query but no embedding, generate a deterministic lexical embedding.
+        let query_embedding = match (self.query.as_deref(), self.query_embedding) {
+            (_, Some(v)) => Some(v),
+            (Some(q), None) if !q.trim().is_empty() => Some(crate::embedding::lexical_embedding(q)),
+            _ => None,
+        };
+
         let payload = ResolvePayload {
             query: self.query,
+            query_embedding,
             entity_id: self.entity_id,
             predicate: self.predicate,
             as_of: self.as_of,

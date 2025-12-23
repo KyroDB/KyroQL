@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ValidationError;
 
 /// A range of time (half-open interval: [from, to)).
-///
+/// 
 /// Used to represent the valid time of a belief—when it is true in reality.
 ///
 /// # Examples
@@ -27,15 +27,63 @@ use crate::error::ValidationError;
 /// assert!(range.contains(Utc::now()));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "TimeRangeRepr", into = "TimeRangeRepr")]
 pub struct TimeRange {
     /// Start of the range (inclusive).
-    pub from: DateTime<Utc>,
+    from: DateTime<Utc>,
 
     /// End of the range (exclusive). None means open-ended.
-    pub to: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TimeRangeRepr {
+    from: DateTime<Utc>,
+    to: Option<DateTime<Utc>>,
+}
+
+impl TryFrom<TimeRangeRepr> for TimeRange {
+    type Error = ValidationError;
+
+    fn try_from(value: TimeRangeRepr) -> Result<Self, Self::Error> {
+        if let Some(to) = value.to {
+            if value.from >= to {
+                return Err(ValidationError::InvalidTimeRange {
+                    from: value.from,
+                    to,
+                });
+            }
+        }
+
+        Ok(Self {
+            from: value.from,
+            to: value.to,
+        })
+    }
+}
+
+impl From<TimeRange> for TimeRangeRepr {
+    fn from(value: TimeRange) -> Self {
+        Self {
+            from: value.from,
+            to: value.to,
+        }
+    }
 }
 
 impl TimeRange {
+    /// Returns the start of the range (inclusive).
+    #[must_use]
+    pub fn from(&self) -> DateTime<Utc> {
+        self.from
+    }
+
+    /// Returns the end of the range (exclusive), or `None` if open-ended.
+    #[must_use]
+    pub fn to(&self) -> Option<DateTime<Utc>> {
+        self.to
+    }
+
     /// Creates a time range from two timestamps.
     ///
     /// # Errors
@@ -163,17 +211,25 @@ impl TimeRange {
 
     /// Extends the end time by the given duration (no-op if open-ended).
     pub fn extend_by(&mut self, duration: Duration) {
+        if duration <= Duration::zero() {
+            return;
+        }
         if let Some(to) = self.to.as_mut() {
             *to = *to + duration;
         }
     }
 
     /// Closes an open-ended range at the current time.
-    /// Ensures the end never precedes the start by clamping to max(now, from).
+    ///
+    /// If the start is in the future, closes at start + 1 microsecond to maintain a valid interval.
     pub fn close_now(&mut self) {
         if self.to.is_none() {
             let now = Utc::now();
-            let end = std::cmp::max(now, self.from);
+            let end = if now > self.from {
+                now
+            } else {
+                self.from + Duration::microseconds(1)
+            };
             self.to = Some(end);
         }
     }
@@ -182,9 +238,9 @@ impl TimeRange {
     ///
     /// # Errors
     ///
-    /// Returns `ValidationError::InvalidTimeRange` if the close time is before the start.
+    /// Returns `ValidationError::InvalidTimeRange` if the close time is not after the start.
     pub fn close_at(&mut self, at: DateTime<Utc>) -> Result<(), ValidationError> {
-        if at < self.from {
+        if at <= self.from {
             return Err(ValidationError::InvalidTimeRange {
                 from: self.from,
                 to: at,
@@ -192,6 +248,18 @@ impl TimeRange {
         }
         self.to = Some(at);
         Ok(())
+    }
+
+    /// Sets the end time, clamping to ensure the interval remains valid.
+    ///
+    /// If `at <= from`, this sets `to = from + 1 microsecond`.
+    pub fn set_to_clamped(&mut self, at: DateTime<Utc>) {
+        let end = if at > self.from {
+            at
+        } else {
+            self.from + Duration::microseconds(1)
+        };
+        self.to = Some(end);
     }
 }
 

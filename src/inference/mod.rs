@@ -1,6 +1,6 @@
 //! Inference layer primitives.
 //!
-//! Phase 2 starts by making conflict-resolution *explicit* and reproducible.
+//! Conflict-resolution policies for reproducible inference.
 //! For now we only implement selection policies (no belief merging).
 
 mod policies;

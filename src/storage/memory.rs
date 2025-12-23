@@ -3,10 +3,10 @@
 //! This module provides thread-safe in-memory implementations of the storage traits.
 //! It is intended for embedded usage, tests, and as a reference implementation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::RwLock;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::belief::Belief;
 use crate::confidence::BeliefId;
@@ -65,6 +65,115 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, StorageError> {
 struct EntityState {
     by_id: HashMap<EntityId, Entity>,
     by_name: HashMap<String, HashSet<EntityId>>,
+    versions: HashMap<EntityId, BTreeMap<u64, Entity>>,
+    merged_into: HashMap<EntityId, EntityId>,
+    merged_from: HashMap<EntityId, HashSet<EntityId>>,
+    embedding_dim: Option<usize>,
+}
+
+fn resolve_canonical_id(state: &EntityState, id: EntityId) -> Result<EntityId, StorageError> {
+    let mut current = id;
+    for _ in 0..128 {
+        let Some(next) = state.merged_into.get(&current).copied() else {
+            return Ok(current);
+        };
+        if next == current {
+            return Err(StorageError::BackendError(
+                "entity merge map contains a self-cycle".to_string(),
+            ));
+        }
+        current = next;
+    }
+
+    Err(StorageError::BackendError(
+        "entity merge map resolution exceeded hop limit".to_string(),
+    ))
+}
+
+fn record_entity_version(
+    state: &mut EntityState,
+    entity: &Entity,
+    context: &'static str,
+) -> Result<(), StorageError> {
+    let versions = state.versions.entry(entity.id).or_default();
+    if versions.contains_key(&entity.version) {
+        return Err(StorageError::BackendError(format!(
+            "duplicate entity version ({context}): id={} version={}",
+            entity.id, entity.version
+        )));
+    }
+    versions.insert(entity.version, entity.clone());
+    Ok(())
+}
+
+fn merge_metadata(primary: &serde_json::Value, secondary: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    match (primary, secondary) {
+        (Value::Null, other) => other.clone(),
+        (Value::Object(a), Value::Object(b)) => {
+            let mut out = a.clone();
+            for (k, v) in b {
+                out.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            Value::Object(out)
+        }
+        (a, _) => a.clone(),
+    }
+}
+
+fn merge_embeddings(a: &[f32], b: &[f32]) -> Result<Vec<f32>, StorageError> {
+    if a.len() != b.len() {
+        return Err(StorageError::BackendError(format!(
+            "cannot merge embeddings with different dimensions: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    if a.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(a.len());
+    let mut norm2 = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let v = (f64::from(x) + f64::from(y)) * 0.5;
+        norm2 += v * v;
+        #[allow(clippy::cast_possible_truncation)]
+        out.push(v as f32);
+    }
+
+    if norm2 <= 0.0 {
+        return Ok(out);
+    }
+    let inv = 1.0 / norm2.sqrt();
+    for v in &mut out {
+        *v = (*v as f64 * inv) as f32;
+    }
+    Ok(out)
+}
+
+fn ensure_embedding_dim(
+    expected: &mut Option<usize>,
+    actual: usize,
+    context: &'static str,
+) -> Result<(), StorageError> {
+    if actual == 0 {
+        return Err(StorageError::BackendError(format!(
+            "embedding dimension must be non-zero ({context})"
+        )));
+    }
+
+    match expected {
+        None => {
+            *expected = Some(actual);
+            Ok(())
+        }
+        Some(exp) if *exp == actual => Ok(()),
+        Some(exp) => Err(StorageError::BackendError(format!(
+            "embedding dimension mismatch ({context}): expected={exp} actual={actual}"
+        ))),
+    }
 }
 
 /// Thread-safe in-memory entity store.
@@ -84,9 +193,16 @@ impl InMemoryEntityStore {
 impl EntityStore for InMemoryEntityStore {
     fn insert(&self, entity: Entity) -> Result<(), StorageError> {
         let mut state = self.state.write().map_err(|_| lock_err("entity.insert"))?;
-        if state.by_id.contains_key(&entity.id) {
+        if state.by_id.contains_key(&entity.id) || state.merged_into.contains_key(&entity.id) {
             return Err(StorageError::DuplicateKey(entity.id.to_string()));
         }
+
+        if let Some(emb) = entity.embedding.as_ref() {
+            ensure_embedding_dim(&mut state.embedding_dim, emb.len(), "entity.insert")?;
+        }
+
+        record_entity_version(&mut state, &entity, "entity.insert")?;
+
         let name_key = normalize_key(&entity.canonical_name);
         state.by_name.entry(name_key).or_default().insert(entity.id);
         state.by_id.insert(entity.id, entity);
@@ -95,16 +211,34 @@ impl EntityStore for InMemoryEntityStore {
 
     fn get(&self, id: EntityId) -> Result<Option<Entity>, StorageError> {
         let state = self.state.read().map_err(|_| lock_err("entity.get"))?;
-        Ok(state.by_id.get(&id).cloned())
+        let canonical = resolve_canonical_id(&state, id)?;
+        Ok(state.by_id.get(&canonical).cloned())
     }
 
     fn update(&self, entity: Entity) -> Result<(), StorageError> {
         let mut state = self.state.write().map_err(|_| lock_err("entity.update"))?;
+        let canonical = resolve_canonical_id(&state, entity.id)?;
+        if canonical != entity.id {
+            return Err(StorageError::BackendError(
+                "cannot update an entity that has been merged".to_string(),
+            ));
+        }
         let prev = state
             .by_id
             .get(&entity.id)
             .cloned()
             .ok_or(StorageError::EntityNotFound(entity.id))?;
+
+        if entity.version <= prev.version {
+            return Err(StorageError::BackendError(format!(
+                "entity version must increase on update: id={} prev={} new={}",
+                entity.id, prev.version, entity.version
+            )));
+        }
+
+        if let Some(emb) = entity.embedding.as_ref() {
+            ensure_embedding_dim(&mut state.embedding_dim, emb.len(), "entity.update")?;
+        }
 
         let prev_key = normalize_key(&prev.canonical_name);
         let new_key = normalize_key(&entity.canonical_name);
@@ -118,12 +252,30 @@ impl EntityStore for InMemoryEntityStore {
             state.by_name.entry(new_key).or_default().insert(entity.id);
         }
 
+        record_entity_version(&mut state, &entity, "entity.update")?;
         state.by_id.insert(entity.id, entity);
         Ok(())
     }
 
     fn delete(&self, id: EntityId) -> Result<(), StorageError> {
         let mut state = self.state.write().map_err(|_| lock_err("entity.delete"))?;
+        let canonical = resolve_canonical_id(&state, id)?;
+        if canonical != id {
+            return Err(StorageError::BackendError(
+                "cannot delete an entity that has been merged".to_string(),
+            ));
+        }
+
+        if state
+            .merged_from
+            .get(&id)
+            .map_or(false, |s| !s.is_empty())
+        {
+            return Err(StorageError::BackendError(
+                "cannot delete an entity that has other entities merged into it".to_string(),
+            ));
+        }
+
         let prev = state
             .by_id
             .remove(&id)
@@ -210,16 +362,21 @@ impl EntityStore for InMemoryEntityStore {
         }
 
         let state = self.state.read().map_err(|_| lock_err("entity.find_by_embedding"))?;
+        if let Some(exp) = state.embedding_dim {
+            if exp != embedding.len() {
+                return Err(StorageError::BackendError(format!(
+                    "embedding dimension mismatch (entity.find_by_embedding): expected={exp} actual={}"
+                    , embedding.len()
+                )));
+            }
+        }
         let mut scored: Vec<(Entity, f32)> = Vec::new();
         for entity in state.by_id.values() {
             let Some(stored) = entity.embedding.as_ref() else {
                 continue;
             };
 
-            let sim = match cosine_similarity(embedding, stored) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+            let sim = cosine_similarity(embedding, stored)?;
 
             if sim > 0.0 {
                 scored.push((entity.clone(), sim));
@@ -230,6 +387,118 @@ impl EntityStore for InMemoryEntityStore {
         scored.truncate(limit);
         Ok(scored)
     }
+
+    fn merge(&self, primary: EntityId, secondary: EntityId) -> Result<Entity, StorageError> {
+        if primary == secondary {
+            return Err(StorageError::BackendError(
+                "cannot merge an entity into itself".to_string(),
+            ));
+        }
+
+        let mut state = self.state.write().map_err(|_| lock_err("entity.merge"))?;
+
+        let primary_canonical = resolve_canonical_id(&state, primary)?;
+        let secondary_canonical = resolve_canonical_id(&state, secondary)?;
+        if primary_canonical == secondary_canonical {
+            return Err(StorageError::BackendError(
+                "cannot merge: both IDs resolve to the same canonical entity".to_string(),
+            ));
+        }
+
+        let mut primary_entity = state
+            .by_id
+            .get(&primary_canonical)
+            .cloned()
+            .ok_or(StorageError::EntityNotFound(primary_canonical))?;
+        let secondary_entity = state
+            .by_id
+            .get(&secondary_canonical)
+            .cloned()
+            .ok_or(StorageError::EntityNotFound(secondary_canonical))?;
+
+        let secondary_names = std::iter::once(secondary_entity.canonical_name.clone())
+            .chain(secondary_entity.aliases.clone());
+        for name in secondary_names {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if name.eq_ignore_ascii_case(&primary_entity.canonical_name) {
+                continue;
+            }
+            if primary_entity
+                .aliases
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            primary_entity.aliases.push(name.to_string());
+        }
+
+        primary_entity.metadata = merge_metadata(&primary_entity.metadata, &secondary_entity.metadata);
+
+        primary_entity.embedding = match (
+            primary_entity.embedding.as_ref(),
+            secondary_entity.embedding.as_ref(),
+        ) {
+            (Some(a), Some(b)) => Some(merge_embeddings(a, b)?),
+            (Some(a), None) => Some(a.clone()),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        };
+
+        let now = Utc::now();
+        primary_entity.updated_at = now;
+        primary_entity.version = primary_entity
+            .version
+            .checked_add(1)
+            .ok_or_else(|| StorageError::BackendError("entity version overflow".to_string()))?;
+
+        if let Some(emb) = primary_entity.embedding.as_ref() {
+            ensure_embedding_dim(&mut state.embedding_dim, emb.len(), "entity.merge")?;
+        }
+
+        record_entity_version(&mut state, &primary_entity, "entity.merge")?;
+        state.by_id.insert(primary_canonical, primary_entity.clone());
+
+        let prev_key = normalize_key(&secondary_entity.canonical_name);
+        if let Some(set) = state.by_name.get_mut(&prev_key) {
+            set.remove(&secondary_canonical);
+            if set.is_empty() {
+                state.by_name.remove(&prev_key);
+            }
+        }
+        state.by_id.remove(&secondary_canonical);
+
+        state
+            .merged_into
+            .insert(secondary_canonical, primary_canonical);
+        state
+            .merged_from
+            .entry(primary_canonical)
+            .or_default()
+            .insert(secondary_canonical);
+
+        Ok(primary_entity)
+    }
+
+    fn get_at_version(&self, id: EntityId, version: u64) -> Result<Option<Entity>, StorageError> {
+        let state = self.state.read().map_err(|_| lock_err("entity.get_at_version"))?;
+        Ok(state
+            .versions
+            .get(&id)
+            .and_then(|m| m.get(&version))
+            .cloned())
+    }
+
+    fn list_versions(&self, id: EntityId) -> Result<Vec<Entity>, StorageError> {
+        let state = self.state.read().map_err(|_| lock_err("entity.list_versions"))?;
+        let Some(map) = state.versions.get(&id) else {
+            return Ok(Vec::new());
+        };
+        Ok(map.values().cloned().collect())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -237,6 +506,7 @@ struct BeliefState {
     by_id: HashMap<BeliefId, Belief>,
     by_entity: HashMap<EntityId, Vec<BeliefId>>,
     by_entity_predicate: HashMap<(EntityId, String), Vec<BeliefId>>,
+    embedding_dim: Option<usize>,
 }
 
 /// Thread-safe in-memory belief store.
@@ -269,6 +539,10 @@ impl BeliefStore for InMemoryBeliefStore {
         let mut state = self.state.write().map_err(|_| lock_err("belief.insert"))?;
         if state.by_id.contains_key(&belief.id) {
             return Err(StorageError::DuplicateKey(belief.id.to_string()));
+        }
+
+        if let Some(emb) = belief.embedding.as_ref() {
+            ensure_embedding_dim(&mut state.embedding_dim, emb.len(), "belief.insert")?;
         }
 
         Self::index_insert(&mut state, &belief);
@@ -327,12 +601,19 @@ impl BeliefStore for InMemoryBeliefStore {
         old_belief.superseded_by = Some(new_id);
 
         // Close the old belief's valid time at the superseding belief's transaction time.
-        // Clamp to ensure we never create an invalid range.
-        let end = std::cmp::max(old_belief.valid_time.from, new_tx);
-        old_belief.valid_time.to = Some(match old_belief.valid_time.to {
+        // Clamp to ensure we never create an invalid (empty) interval.
+        let end = if new_tx > old_belief.valid_time.from() {
+            new_tx
+        } else {
+            old_belief.valid_time.from() + Duration::microseconds(1)
+        };
+
+        let end = match old_belief.valid_time.to() {
             Some(existing) => existing.min(end),
             None => end,
-        });
+        };
+
+        old_belief.valid_time.set_to_clamped(end);
 
         // Update the forward link on the new belief.
         let new_belief = state
@@ -415,6 +696,15 @@ impl BeliefStore for InMemoryBeliefStore {
             .read()
             .map_err(|_| lock_err("belief.find_by_embedding"))?;
 
+        if let Some(exp) = state.embedding_dim {
+            if exp != embedding.len() {
+                return Err(StorageError::BackendError(format!(
+                    "embedding dimension mismatch (belief.find_by_embedding): expected={exp} actual={}"
+                    , embedding.len()
+                )));
+            }
+        }
+
         let mut scored: Vec<(Belief, f32)> = Vec::new();
         for belief in state.by_id.values() {
             let Some(stored) = belief.embedding.as_ref() else {
@@ -424,10 +714,7 @@ impl BeliefStore for InMemoryBeliefStore {
                 continue;
             }
 
-            let sim = match cosine_similarity(embedding, stored) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+            let sim = cosine_similarity(embedding, stored)?;
 
             if sim > 0.0 {
                 scored.push((belief.clone(), sim));
@@ -765,13 +1052,15 @@ mod tests {
         assert_eq!(emb[0].0.id, id);
         assert!(emb[0].1 > 0.99);
 
-        // Dimension mismatch is handled by skipping (no results).
-        let emb_bad = store.find_by_embedding(&[1.0, 0.0], 10).unwrap();
-        assert!(emb_bad.is_empty());
+        // Dimension mismatch is rejected (caller must provide correct dimensionality).
+        assert!(matches!(
+            store.find_by_embedding(&[1.0, 0.0], 10),
+            Err(StorageError::BackendError(_))
+        ));
 
         // Update reindexes by canonical name.
         let mut e2 = got.clone();
-        e2.canonical_name = "Acme Incorporated".to_string();
+        e2.set_canonical_name("Acme Incorporated");
         store.update(e2.clone()).unwrap();
         assert!(store.find_by_name("acme corp").unwrap().is_empty());
         assert_eq!(store.find_by_name("acme incorporated").unwrap()[0].id, id);
@@ -781,6 +1070,64 @@ mod tests {
         assert!(store.get(id).unwrap().is_none());
         assert!(store.find_by_name("acme incorporated").unwrap().is_empty());
         assert!(matches!(store.delete(id), Err(StorageError::EntityNotFound(_))));
+    }
+
+    #[test]
+    fn entity_version_history_is_recorded_and_queryable() {
+        let store = InMemoryEntityStore::new();
+
+        let mut e = Entity::new("Acme Corp", crate::entity::EntityType::Organization);
+        let id = e.id;
+        store.insert(e.clone()).unwrap();
+
+        let v1 = store.get_at_version(id, 1).unwrap().unwrap();
+        assert_eq!(v1.version, 1);
+
+        e.add_alias("ACME");
+        store.update(e.clone()).unwrap();
+
+        let v2 = store.get_at_version(id, 2).unwrap().unwrap();
+        assert_eq!(v2.version, 2);
+
+        let versions = store.list_versions(id).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version, 1);
+        assert_eq!(versions[1].version, 2);
+    }
+
+    #[test]
+    fn entity_merge_preserves_history_and_resolves_secondary_id() {
+        let store = InMemoryEntityStore::new();
+
+        let mut primary = Entity::new("Acme Corp", crate::entity::EntityType::Organization);
+        primary.add_alias("ACME");
+        let primary_id = primary.id;
+
+        let mut secondary = Entity::new("Acme Corporation", crate::entity::EntityType::Organization);
+        secondary.add_alias("Acme Co.");
+        let secondary_id = secondary.id;
+
+        store.insert(primary.clone()).unwrap();
+        store.insert(secondary.clone()).unwrap();
+
+        let merged = store.merge(primary_id, secondary_id).unwrap();
+        assert_eq!(merged.id, primary_id);
+        assert!(merged.aliases.iter().any(|a| a.eq_ignore_ascii_case("acme corporation")));
+        assert!(merged.aliases.iter().any(|a| a.eq_ignore_ascii_case("acme co.")));
+
+        let primary_current = store.get(primary_id).unwrap().unwrap();
+        assert_eq!(primary_current.id, primary_id);
+
+        let secondary_resolved = store.get(secondary_id).unwrap().unwrap();
+        assert_eq!(secondary_resolved.id, primary_id);
+
+        let secondary_versions = store.list_versions(secondary_id).unwrap();
+        assert!(!secondary_versions.is_empty());
+        let earliest = secondary_versions[0].version;
+        assert!(store
+            .get_at_version(secondary_id, earliest)
+            .unwrap()
+            .is_some());
     }
 
     fn mk_belief(entity_id: EntityId, predicate: &str, value: Value, tx_time: DateTime<Utc>) -> Belief {
@@ -854,7 +1201,7 @@ mod tests {
         beliefs.supersede(old_id, new_id).unwrap();
         let old_after = beliefs.get(old_id).unwrap().unwrap();
         assert_eq!(old_after.superseded_by, Some(new_id));
-        assert!(old_after.valid_time.to.is_some());
+        assert!(old_after.valid_time.to().is_some());
 
         let new_after = beliefs.get(new_id).unwrap().unwrap();
         assert_eq!(new_after.supersedes, Some(old_id));

@@ -36,32 +36,30 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-// Phase 0: Core types
 pub mod belief;
-pub mod confidence;
 pub mod conflict;
 pub mod entity;
+pub mod embedding;
 pub mod error;
-pub mod frame;
 pub mod pattern;
-pub mod source;
-pub mod time;
-pub mod value;
 pub mod inference; // Exposing the inference module
 
-// Phase 1: execution engine
 pub mod engine;
 
-// Phase 1: IR, Storage, and Operations
 pub mod ir;
 pub mod operations;
 pub mod storage;
+
+// Module aliases to preserve stable paths while matching the documented layout.
+pub use belief::{confidence, source, time, value};
+pub use operations::belief_frame as frame;
 
 // Re-export primary types at crate root for convenience
 pub use belief::{Belief, ConsistencyStatus};
 pub use confidence::{BeliefId, CalibrationMode, Confidence, ConfidenceSource, SourceId};
 pub use conflict::{Conflict, ConflictId, ConflictStatus, ConflictType};
 pub use entity::{Entity, EntityId, EntityType};
+pub use embedding::{lexical_embedding, DEFAULT_EMBEDDING_DIM};
 pub use error::{KyroError, ValidationError};
 pub use frame::{BeliefFrame, Evidence, GapType, KnowledgeGap, RankedClaim};
 pub use pattern::{Pattern, PatternId, PatternRule};
@@ -69,7 +67,6 @@ pub use source::Source;
 pub use time::TimeRange;
 pub use value::Value;
 
-// Phase 1 re-exports
 pub use ir::{
 	AssertPayload, ConsistencyMode, DefinePatternPayload, KyroIR, Operation, ResolvePayload,
 	RetractPayload,

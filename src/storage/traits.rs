@@ -82,6 +82,28 @@ pub trait EntityStore: Send + Sync {
         embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(Entity, f32)>, StorageError>;
+
+    /// Merge `secondary` into `primary`, returning the merged entity.
+    ///
+    /// After a successful merge:
+    /// - Calling `get(secondary_id)` returns the merged primary entity
+    /// - Historical versions of the secondary remain accessible via `get_at_version(secondary_id, version)`
+    ///   and `list_versions(secondary_id)`
+    ///
+    /// # Errors
+    /// - `EntityNotFound`: If either `primary` or `secondary` does not exist
+    /// - `BackendError`: If `primary == secondary` or other merge conflicts occur
+    fn merge(&self, primary: EntityId, secondary: EntityId) -> Result<Entity, StorageError>;
+
+    /// Retrieve the entity snapshot for an exact version.
+    ///
+    /// Versions start at 1 on insert and increment on every update/merge. Implementations should
+    /// return `Ok(None)` when the entity is missing or the requested version is not recorded. Use
+    /// `list_versions` to discover available versions.
+    fn get_at_version(&self, id: EntityId, version: u64) -> Result<Option<Entity>, StorageError>;
+
+    /// List all stored versions for an entity (ascending by version).
+    fn list_versions(&self, id: EntityId) -> Result<Vec<Entity>, StorageError>;
 }
 
 /// Storage trait for Belief operations.

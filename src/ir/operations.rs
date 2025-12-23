@@ -2,12 +2,13 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json;
 use uuid::Uuid;
 
 use crate::confidence::{BeliefId, Confidence};
 use crate::entity::EntityId;
 use crate::inference::ConflictResolutionPolicy;
-use crate::pattern::PatternRule;
+use crate::pattern::{PatternId, PatternRule};
 use crate::source::Source;
 use crate::time::TimeRange;
 use crate::value::Value;
@@ -20,7 +21,7 @@ use super::ConsistencyMode;
 /// - Protocol versioning for forward/backward compatibility
 /// - Request tracking via unique IDs
 /// - Timestamp for audit logs
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KyroIR {
     /// Protocol version (e.g., "1.0").
     pub version: String,
@@ -57,7 +58,7 @@ impl KyroIR {
 }
 
 /// All supported KyroQL operations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", content = "payload", rename_all = "snake_case")]
 pub enum Operation {
     /// Assert a new belief into the knowledge base.
@@ -65,6 +66,15 @@ pub enum Operation {
 
     /// Resolve/query beliefs from the knowledge base.
     Resolve(ResolvePayload),
+
+    /// Create a simulation context for counterfactual reasoning.
+    Simulate(SimulatePayload),
+
+    /// Register a monitor/trigger subscription.
+    Monitor(MonitorPayload),
+
+    /// Record a derived belief chain.
+    Derive(DerivePayload),
 
     /// Retract (mark as superseded) an existing belief.
     Retract(RetractPayload),
@@ -143,6 +153,90 @@ pub struct ResolvePayload {
     /// If not provided, the engine uses its default policy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict_policy: Option<ConflictResolutionPolicy>,
+
+    /// Optional vector embedding for the query (semantic RESOLVE path).
+    ///
+    /// If omitted and `query` is present, the engine may fall back to lexical matching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_embedding: Option<Vec<f32>>,
+}
+
+// NOTE: IR equality is used primarily for tests/roundtrips/debug assertions.
+// We intentionally avoid bitwise/IEEE exact float equality here because:
+// - `NaN != NaN` breaks reflexivity for `PartialEq`
+// - small serialization/compute variations are expected
+// Chosen tolerance: 1e-6 (abs + rel), which is strict enough for confidence/embeddings
+// without being brittle.
+const F32_ABS_EPS: f32 = 1.0e-6;
+const F32_REL_EPS: f32 = 1.0e-6;
+
+#[inline]
+fn f32_approx_eq(a: f32, b: f32) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_nan() && b.is_nan() {
+        return true;
+    }
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    let diff = (a - b).abs();
+    diff <= F32_ABS_EPS || diff <= F32_REL_EPS * a.abs().max(b.abs())
+}
+
+#[inline]
+fn opt_f32_approx_eq(a: &Option<f32>, b: &Option<f32>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => f32_approx_eq(*a, *b),
+        _ => false,
+    }
+}
+
+#[inline]
+fn slice_f32_approx_eq(a: &[f32], b: &[f32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(a, b)| f32_approx_eq(*a, *b))
+}
+
+#[inline]
+fn opt_vec_f32_approx_eq(a: &Option<Vec<f32>>, b: &Option<Vec<f32>>) -> bool {
+    match (a.as_deref(), b.as_deref()) {
+        (None, None) => true,
+        (Some(a), Some(b)) => slice_f32_approx_eq(a, b),
+        _ => false,
+    }
+}
+
+impl PartialEq for AssertPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.entity_id == other.entity_id
+            && self.predicate == other.predicate
+            && self.value == other.value
+            && self.confidence == other.confidence
+            && self.source == other.source
+            && self.valid_time == other.valid_time
+            && self.consistency_mode == other.consistency_mode
+            && opt_vec_f32_approx_eq(&self.embedding, &other.embedding)
+    }
+}
+
+impl PartialEq for ResolvePayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.query == other.query
+            && self.entity_id == other.entity_id
+            && self.predicate == other.predicate
+            && self.as_of == other.as_of
+            && opt_f32_approx_eq(&self.min_confidence, &other.min_confidence)
+            && self.limit == other.limit
+            && self.include_counter_evidence == other.include_counter_evidence
+            && self.include_gaps == other.include_gaps
+            && self.conflict_policy == other.conflict_policy
+            && opt_vec_f32_approx_eq(&self.query_embedding, &other.query_embedding)
+    }
 }
 
 fn default_limit() -> usize {
@@ -165,12 +259,122 @@ impl Default for ResolvePayload {
             include_counter_evidence: false,
             include_gaps: true,
             conflict_policy: None,
+            query_embedding: None,
         }
     }
 }
 
+/// Payload for SIMULATE operations.
+///
+/// Simulation request payload.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SimulatePayload {
+    /// Optional scenario description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<String>,
+
+    /// Optional context object (structured state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+
+    /// Optional list of entities participating in the simulation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entities: Option<Vec<EntityId>>,
+
+    /// Optional initial conditions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_conditions: Option<Value>,
+
+    /// Optional constraints or limits for the simulation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<Value>,
+
+    /// Optional time range for the simulation horizon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_horizon: Option<TimeRange>,
+
+    /// Optional outcome parameters to request specific projections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_parameters: Option<Value>,
+}
+
+/// Payload for MONITOR operations.
+///
+/// Monitoring request payload.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MonitorPayload {
+    /// Optional human-readable description of what to monitor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Optional predicates to watch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicates: Option<Vec<String>>,
+
+    /// Optional entity filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_filter: Option<Vec<EntityId>>,
+
+    /// Optional pattern filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern_filter: Option<Vec<PatternId>>,
+
+    /// Optional threshold or trigger condition payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<Value>,
+
+    /// Optional expiration time for the monitor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+
+    /// Optional callback or notification configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback: Option<Value>,
+}
+
+/// Payload for DERIVE operations.
+///
+/// Derivation request payload.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DerivePayload {
+    /// Optional derivation rule identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+
+    /// Optional source belief identifiers that feed the derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<BeliefId>>,
+
+    /// Optional list of inference steps or rules applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_steps: Option<Vec<String>>,
+
+    /// Optional propagated confidence for the derived result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+
+    /// Optional justification/explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub justification: Option<String>,
+
+    /// Optional extensible metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl PartialEq for DerivePayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.rule == other.rule
+            && self.sources == other.sources
+            && self.inference_steps == other.inference_steps
+            && opt_f32_approx_eq(&self.confidence, &other.confidence)
+            && self.justification == other.justification
+            && self.metadata == other.metadata
+    }
+}
+
 /// Payload for RETRACT operations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RetractPayload {
     /// The belief to retract.
     pub belief_id: BeliefId,
@@ -184,7 +388,7 @@ pub struct RetractPayload {
 }
 
 /// Payload for DEFINE_PATTERN operations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DefinePatternPayload {
     /// Human-readable name for the pattern.
     pub name: String,
@@ -271,6 +475,7 @@ mod tests {
             query: Some("What is the temperature?".to_string()),
             entity_id: Some(EntityId::new()),
             predicate: Some("temperature".to_string()),
+            query_embedding: None,
             as_of: None,
             min_confidence: Some(0.5),
             limit: 5,

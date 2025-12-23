@@ -119,13 +119,13 @@ pub struct Belief {
     /// Current consistency status.
     pub consistency_status: ConsistencyStatus,
     /// ID of the belief this one supersedes.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<BeliefId>,
     /// ID of the belief that superseded this one.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<BeliefId>,
     /// Optional embedding for semantic search.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
 }
 

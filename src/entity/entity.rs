@@ -271,6 +271,17 @@ impl Entity {
         }
     }
 
+    /// Updates the canonical name for this entity.
+    ///
+    /// If the name changes, this increments the entity version and updates `updated_at`.
+    pub fn set_canonical_name(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if self.canonical_name != name {
+            self.canonical_name = name;
+            self.touch();
+        }
+    }
+
     /// Adds an alias to this entity.
     pub fn add_alias(&mut self, alias: impl Into<String>) {
         let alias = alias.into();
@@ -282,8 +293,19 @@ impl Entity {
 
     /// Sets the embedding vector for semantic matching.
     pub fn set_embedding(&mut self, embedding: Vec<f32>) {
-        self.embedding = Some(embedding);
-        self.touch();
+        let is_same = self
+            .embedding
+            .as_ref()
+            .map_or(false, |current| current.len() == embedding.len()
+                && current
+                    .iter()
+                    .zip(&embedding)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()));
+
+        if !is_same {
+            self.embedding = Some(embedding);
+            self.touch();
+        }
     }
 
     /// Updates the `updated_at` timestamp and increments the version.
