@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo test
+        run: cargo test
+
+      - name: Allocation budgets (Reflex)
+        run: cargo test --test alloc_reflex
+
+      - name: Phase 2 benchmarks
+        run: cargo bench --bench phase2
+
+      - name: Benchmark budgets
+        run: cargo run --release --bin bench_guard

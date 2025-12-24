@@ -5,6 +5,9 @@
 
 mod write_path;
 
+/// Routed runtime enforcing Reflex/Reflection isolation.
+pub mod runtime;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{OnceLock, RwLock};
@@ -18,8 +21,9 @@ use crate::entity::{EntityId};
 use crate::error::{ExecutionError, KyroError, KyroResult, ValidationError};
 use crate::frame::{BeliefFrame, Evidence, KnowledgeGap, RankedClaim};
 use crate::inference::{apply_conflict_policy, ConflictResolutionPolicy, PolicyDecision};
-use crate::ir::{ConsistencyMode, DefinePatternPayload, KyroIR, Operation, ResolvePayload, RetractPayload};
+use crate::ir::{ConsistencyMode, DefinePatternPayload, KyroIR, Operation, ResolvePayload, RetractPayload, SimulatePayload};
 use crate::pattern::{Pattern, PatternId, PatternRule};
+use crate::simulation::{SimulateConstraints, SimulationBaseStores, SimulationContext};
 use crate::storage::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
 use crate::time::TimeRange;
 use crate::value::Value;
@@ -90,6 +94,12 @@ pub enum EngineResponse {
         /// The stored pattern ID.
         pattern_id: PatternId,
     },
+
+    /// Result of a SIMULATE.
+    Simulate {
+        /// The created simulation context.
+        simulation: Arc<SimulationContext>,
+    },
 }
 
 /// KyroQL execution engine.
@@ -127,9 +137,7 @@ impl KyroEngine {
         match ir.operation {
             Operation::Assert(payload) => self.execute_assert(ir.timestamp, payload.consistency_mode, payload.entity_id, payload.predicate, payload.value, payload.confidence, payload.source, payload.valid_time, payload.embedding),
             Operation::Resolve(payload) => self.execute_resolve(payload),
-            Operation::Simulate(_) => Err(KyroError::Execution(ExecutionError::NotImplemented {
-                operation: "simulate".to_string(),
-            })),
+            Operation::Simulate(payload) => self.execute_simulate(payload),
             Operation::Monitor(_) => Err(KyroError::Execution(ExecutionError::NotImplemented {
                 operation: "monitor".to_string(),
             })),
@@ -139,6 +147,44 @@ impl KyroEngine {
             Operation::Retract(payload) => self.execute_retract(ir.timestamp, payload),
             Operation::DefinePattern(payload) => self.execute_define_pattern(payload),
         }
+    }
+
+    fn execute_simulate(&self, payload: SimulatePayload) -> KyroResult<EngineResponse> {
+        let constraints = match payload.constraints {
+            None => SimulateConstraints::default(),
+            Some(Value::Null) => SimulateConstraints::default(),
+            Some(Value::Structured(v)) => serde_json::from_value::<SimulateConstraints>(v)
+                .map_err(|e| KyroError::Validation(ValidationError::InvalidSimulationConstraints {
+                    reason: format!("invalid constraints object: {e}"),
+                }))?,
+            Some(other) => {
+                return Err(KyroError::Validation(ValidationError::InvalidSimulationConstraints {
+                    reason: format!(
+                        "constraints must be Value::Structured (JSON object), got {other:?}"
+                    ),
+                }));
+            }
+        };
+
+        constraints.validate().map_err(KyroError::from)?;
+
+        if let Some(entities) = payload.entities.as_ref() {
+            for &id in entities {
+                self.ensure_entity_exists(id)?;
+            }
+        }
+
+        let base = SimulationBaseStores {
+            entities: Arc::clone(&self.entities),
+            beliefs: Arc::clone(&self.beliefs),
+            patterns: Arc::clone(&self.patterns),
+            conflicts: Arc::clone(&self.conflicts),
+        };
+
+        let ctx = SimulationContext::new(base, constraints)?;
+        Ok(EngineResponse::Simulate {
+            simulation: Arc::new(ctx),
+        })
     }
 
     fn storage_err(err: StorageError) -> KyroError {

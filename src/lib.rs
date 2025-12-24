@@ -46,6 +46,8 @@ pub mod inference; // Exposing the inference module
 
 pub mod engine;
 
+pub mod simulation;
+
 pub mod ir;
 pub mod operations;
 pub mod storage;
@@ -69,9 +71,10 @@ pub use value::Value;
 
 pub use ir::{
 	AssertPayload, ConsistencyMode, DefinePatternPayload, KyroIR, Operation, ResolvePayload,
-	RetractPayload,
+	ResolveMode, RetractPayload,
 };
 pub use operations::{AssertBuilder, ResolveBuilder};
+pub use operations::SimulateBuilder;
 pub use storage::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
 pub use storage::{
 	InMemoryBeliefStore, InMemoryConflictStore, InMemoryEntityStore, InMemoryPatternStore,
@@ -79,5 +82,8 @@ pub use storage::{
 };
 
 pub use engine::{EngineResponse, KyroEngine};
+pub use engine::runtime::{DefaultRouter, ExecutionHandle, ExecutionPath, KyroRuntime, KyroRuntimeConfig};
 pub use inference::ConflictResolutionPolicy; // Exposing ConflictResolutionPolicy from inference module
+
+pub use simulation::{SimulateConstraints, SimulationContext, SimulationId, SimulationImpact};
 

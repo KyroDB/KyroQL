@@ -14,6 +14,7 @@ use crate::time::TimeRange;
 /// A ranked claim with separate confidence and relevance scores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RankedClaim {
+    /// The underlying belief.
     pub belief: Belief,
 
     /// Epistemic confidence: Is this claim true? (0.0 - 1.0)
@@ -27,6 +28,7 @@ pub struct RankedClaim {
 }
 
 impl RankedClaim {
+    /// Create a new ranked claim, clamping scores to [0.0, 1.0].
     #[must_use]
     pub fn new(belief: Belief, epistemic_confidence: f32, retrieval_relevance: f32) -> Self {
         let epistemic_confidence = epistemic_confidence.clamp(0.0, 1.0);
@@ -45,14 +47,20 @@ impl RankedClaim {
 /// A piece of evidence supporting or contradicting a claim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evidence {
+    /// ID of the belief providing evidence.
     pub belief_id: BeliefId,
+    /// Natural language or structured summary of the evidence.
     pub summary: String,
+    /// Source attribution for this evidence.
     pub source: Source,
+    /// Epistemic confidence of this evidence.
     pub confidence: f32,
+    /// Relevance of this evidence to the query.
     pub relevance: f32,
 }
 
 impl Evidence {
+    /// Create new evidence, clamping scores to [0.0, 1.0].
     #[must_use]
     pub fn new(
         belief_id: BeliefId,
@@ -71,34 +79,45 @@ impl Evidence {
     }
 }
 
-/// Types of knowledge gaps.
+/// Types of knowledge gaps encountered during resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GapType {
+    /// No beliefs found matching the query.
     NoDataFound,
+    /// Beliefs found but all are below the confidence threshold.
     LowConfidenceOnly,
+    /// Data exists but is outside the requested temporal window.
     ExpiredData,
+    /// The subject entity could not be resolved.
     MissingEntity,
+    /// Evidence exists but is insufficient to form a claim.
     InsufficientEvidence,
 }
 
-/// A detected gap in knowledge.
+/// A detected gap in knowledge with actionable metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeGap {
+    /// The classification of this gap.
     pub gap_type: GapType,
+    /// Human-readable description of what is missing.
     pub description: String,
 
+    /// Optional query suggestion to fill this gap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_query: Option<String>,
 
+    /// Specific entity associated with the gap, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub missing_entity: Option<EntityId>,
 
+    /// Specific predicate associated with the gap, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub missing_predicate: Option<String>,
 }
 
 impl KnowledgeGap {
+    /// Create a new knowledge gap.
     #[must_use]
     pub fn new(gap_type: GapType, description: impl Into<String>) -> Self {
         Self {
@@ -110,6 +129,7 @@ impl KnowledgeGap {
         }
     }
 
+    /// Create a gap for a missing entity.
     #[must_use]
     pub fn missing_entity(description: impl Into<String>) -> Self {
         Self {
@@ -121,18 +141,21 @@ impl KnowledgeGap {
         }
     }
 
+    /// Attach a suggested query to the gap.
     #[must_use]
     pub fn with_suggested_query(mut self, query: impl Into<String>) -> Self {
         self.suggested_query = Some(query.into());
         self
     }
 
+    /// Attach a missing entity ID to the gap.
     #[must_use]
     pub fn with_missing_entity(mut self, entity_id: EntityId) -> Self {
         self.missing_entity = Some(entity_id);
         self
     }
 
+    /// Attach a missing predicate to the gap.
     #[must_use]
     pub fn with_missing_predicate(mut self, predicate: impl Into<String>) -> Self {
         self.missing_predicate = Some(predicate.into());
@@ -143,9 +166,13 @@ impl KnowledgeGap {
 /// Assumptions made during query execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryAssumptions {
+    /// Policy used to resolve contradictions.
     pub conflict_policy: ConflictResolutionPolicy,
+    /// Minimum confidence threshold applied.
     pub min_confidence: Option<f32>,
+    /// The trust model used for source weighting.
     pub trust_model: String,
+    /// The effective time for the query.
     pub as_of_time: DateTime<Utc>,
 }
 
@@ -207,16 +234,19 @@ impl BeliefFrame {
         }
     }
 
+    /// Returns true if the frame contains a primary answer.
     #[must_use]
     pub fn has_answer(&self) -> bool {
         self.best_supported_claim.is_some()
     }
 
+    /// Returns true if conflicts were detected during resolution.
     #[must_use]
     pub fn has_conflicts(&self) -> bool {
         !self.conflicts.is_empty()
     }
 
+    /// Returns true if knowledge gaps were identified.
     #[must_use]
     pub fn has_gaps(&self) -> bool {
         !self.gaps.is_empty()

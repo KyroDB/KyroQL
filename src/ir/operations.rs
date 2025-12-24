@@ -116,6 +116,13 @@ pub struct AssertPayload {
 /// Payload for RESOLVE operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvePayload {
+    /// Controls how much work RESOLVE is allowed to do.
+    ///
+    /// This is used for routing between Reflex (fast, bounded) and Reflection
+    /// (slow, deliberative) execution paths.
+    #[serde(default)]
+    pub mode: ResolveMode,
+
     /// Natural language or structured query.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
@@ -159,6 +166,24 @@ pub struct ResolvePayload {
     /// If omitted and `query` is present, the engine may fall back to lexical matching.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_embedding: Option<Vec<f32>>,
+}
+
+/// Routing hint for RESOLVE.
+///
+/// - `Simple` is intended for Reflex execution (fast, bounded work).
+/// - `Aggregate` and `Temporal` are intended for Reflection execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolveMode {
+    /// Fast, bounded RESOLVE.
+    #[default]
+    Simple,
+
+    /// Synthesis RESOLVE (evidence/counter-evidence, richer frame).
+    Aggregate,
+
+    /// Temporal RESOLVE (as-of, diffs, trajectories).
+    Temporal,
 }
 
 // NOTE: IR equality is used primarily for tests/roundtrips/debug assertions.
@@ -226,7 +251,8 @@ impl PartialEq for AssertPayload {
 
 impl PartialEq for ResolvePayload {
     fn eq(&self, other: &Self) -> bool {
-        self.query == other.query
+        self.mode == other.mode
+            && self.query == other.query
             && self.entity_id == other.entity_id
             && self.predicate == other.predicate
             && self.as_of == other.as_of
@@ -250,6 +276,7 @@ fn default_true() -> bool {
 impl Default for ResolvePayload {
     fn default() -> Self {
         Self {
+            mode: ResolveMode::Simple,
             query: None,
             entity_id: None,
             predicate: None,
@@ -472,6 +499,7 @@ mod tests {
     #[test]
     fn test_resolve_payload_serialization() {
         let payload = ResolvePayload {
+            mode: ResolveMode::Simple,
             query: Some("What is the temperature?".to_string()),
             entity_id: Some(EntityId::new()),
             predicate: Some("temperature".to_string()),

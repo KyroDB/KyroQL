@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use crate::entity::EntityId;
 use crate::error::ValidationError;
 use crate::inference::ConflictResolutionPolicy;
-use crate::ir::{KyroIR, Operation, ResolvePayload};
+use crate::ir::{KyroIR, Operation, ResolveMode, ResolvePayload};
 
 /// Builder for RESOLVE operations.
 ///
@@ -27,6 +27,7 @@ pub struct ResolveBuilder {
     query_embedding: Option<Vec<f32>>,
     entity_id: Option<EntityId>,
     predicate: Option<String>,
+    mode: ResolveMode,
     as_of: Option<DateTime<Utc>>,
     min_confidence: Option<f32>,
     limit: Option<usize>,
@@ -42,6 +43,7 @@ impl Default for ResolveBuilder {
             query_embedding: None,
             entity_id: None,
             predicate: None,
+            mode: ResolveMode::Simple,
             as_of: None,
             min_confidence: None,
             limit: None,
@@ -83,6 +85,16 @@ impl ResolveBuilder {
     #[must_use]
     pub fn predicate(mut self, predicate: impl Into<String>) -> Self {
         self.predicate = Some(predicate.into());
+        self
+    }
+
+    /// Select the RESOLVE mode.
+    ///
+    /// This is a routing hint for execution-path selection (Reflex vs Reflection).
+    /// Default: `ResolveMode::Simple`.
+    #[must_use]
+    pub fn mode(mut self, mode: ResolveMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -161,6 +173,7 @@ impl ResolveBuilder {
         };
 
         let payload = ResolvePayload {
+            mode: self.mode,
             query: self.query,
             query_embedding,
             entity_id: self.entity_id,

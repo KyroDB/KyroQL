@@ -75,6 +75,13 @@ pub enum ValidationError {
         /// Reason for invalidity.
         reason: String,
     },
+
+    /// Simulation constraints are invalid.
+    #[error("Invalid simulation constraints: {reason}")]
+    InvalidSimulationConstraints {
+        /// Reason for invalidity.
+        reason: String,
+    },
 }
 
 /// Execution errors that occur during operation execution.
@@ -117,6 +124,31 @@ pub enum ExecutionError {
     Timeout {
         /// Duration before timeout.
         duration_ms: u64,
+    },
+
+    /// Runtime worker pool disconnected before producing a reply.
+    #[error("Runtime worker pool disconnected for {path} path")]
+    Disconnected {
+        /// Execution path name.
+        path: String,
+    },
+
+    /// The runtime queue is full.
+    #[error("Runtime queue is full for {path} path (capacity={capacity})")]
+    QueueFull {
+        /// Execution path name.
+        path: String,
+        /// Queue capacity.
+        capacity: usize,
+    },
+
+    /// An operation was provided where a different one was required.
+    #[error("Invalid operation: expected {expected}, got {actual}")]
+    InvalidOperation {
+        /// Expected operation name.
+        expected: String,
+        /// Actual operation name.
+        actual: String,
     },
 
     /// Operation is recognized but not implemented in the current build.

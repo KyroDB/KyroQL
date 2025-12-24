@@ -14,7 +14,7 @@ mod validation;
 pub use consistency::ConsistencyMode;
 pub use operations::{
     AssertPayload, DefinePatternPayload, DerivePayload, KyroIR, MonitorPayload, Operation,
-    ResolvePayload, RetractPayload, SimulatePayload,
+    ResolveMode, ResolvePayload, RetractPayload, SimulatePayload,
 };
 
 pub use serialization::{from_json, to_json_pretty};
