@@ -159,6 +159,69 @@ impl ConflictStore for ReadOnlyConflictStore {
     }
 }
 
+/// Read-only wrapper for `BeliefStore`.
+///
+/// This is used to ensure simulation overlays cannot accidentally mutate their base,
+/// including when nesting a simulation on top of another simulation.
+#[derive(Clone)]
+pub struct ReadOnlyBeliefStore {
+    base: Arc<dyn BeliefStore>,
+}
+
+impl ReadOnlyBeliefStore {
+    fn new(base: Arc<dyn BeliefStore>) -> Self {
+        Self { base }
+    }
+}
+
+impl BeliefStore for ReadOnlyBeliefStore {
+    fn insert(&self, _belief: Belief) -> Result<(), StorageError> {
+        Err(ro_err("belief.insert"))
+    }
+
+    fn get(&self, id: BeliefId) -> Result<Option<Belief>, StorageError> {
+        self.base.get(id)
+    }
+
+    fn supersede(&self, _old_id: BeliefId, _new_id: BeliefId) -> Result<(), StorageError> {
+        Err(ro_err("belief.supersede"))
+    }
+
+    fn find_by_entity_predicate(
+        &self,
+        entity_id: EntityId,
+        predicate: &str,
+    ) -> Result<Vec<Belief>, StorageError> {
+        self.base.find_by_entity_predicate(entity_id, predicate)
+    }
+
+    fn find_as_of(
+        &self,
+        entity_id: EntityId,
+        predicate: &str,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<Belief>, StorageError> {
+        self.base.find_as_of(entity_id, predicate, as_of)
+    }
+
+    fn find_by_time_range(&self, range: &TimeRange) -> Result<Vec<Belief>, StorageError> {
+        self.base.find_by_time_range(range)
+    }
+
+    fn find_by_embedding(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        min_confidence: Option<f32>,
+    ) -> Result<Vec<(Belief, f32)>, StorageError> {
+        self.base.find_by_embedding(embedding, limit, min_confidence)
+    }
+
+    fn count_by_entity(&self, entity_id: EntityId) -> Result<usize, StorageError> {
+        self.base.count_by_entity(entity_id)
+    }
+}
+
 /// Belief store overlay: writes land in-memory, reads merge base+delta.
 pub struct DeltaBeliefStore {
     base: Arc<dyn BeliefStore>,
@@ -388,9 +451,10 @@ pub struct DeltaStore {
 impl DeltaStore {
     /// Create a delta store overlay.
     pub fn new(base: SimulationBaseStores, constraints: SimulateConstraints) -> Self {
+        let ro_beliefs: Arc<dyn BeliefStore> = Arc::new(ReadOnlyBeliefStore::new(base.beliefs));
         Self {
             entities: Arc::new(ReadOnlyEntityStore::new(base.entities)),
-            beliefs: Arc::new(DeltaBeliefStore::new(base.beliefs, constraints)),
+            beliefs: Arc::new(DeltaBeliefStore::new(ro_beliefs, constraints)),
             patterns: Arc::new(ReadOnlyPatternStore::new(base.patterns)),
             conflicts: Arc::new(ReadOnlyConflictStore::new(base.conflicts)),
         }

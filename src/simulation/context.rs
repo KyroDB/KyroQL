@@ -77,6 +77,8 @@ pub struct SimulationContext {
     /// Simulation identity.
     pub id: SimulationId,
     constraints: SimulateConstraints,
+    nesting_level: usize,
+    remaining_depth: usize,
     created_at: Instant,
     deadline: Instant,
     hypothetical_count: AtomicUsize,
@@ -92,6 +94,8 @@ impl fmt::Debug for SimulationContext {
         f.debug_struct("SimulationContext")
             .field("id", &self.id)
             .field("constraints", &self.constraints)
+            .field("nesting_level", &self.nesting_level)
+            .field("remaining_depth", &self.remaining_depth)
             .field("created_at", &self.created_at)
             .field("deadline", &self.deadline)
             .field(
@@ -106,19 +110,37 @@ impl fmt::Debug for SimulationContext {
 impl SimulationContext {
     /// Create a new simulation context.
     pub fn new(base: SimulationBaseStores, constraints: SimulateConstraints) -> KyroResult<Self> {
+        Self::new_internal(base, constraints, 0, None)
+    }
+
+    fn new_internal(
+        base: SimulationBaseStores,
+        constraints: SimulateConstraints,
+        nesting_level: usize,
+        deadline_cap: Option<Instant>,
+    ) -> KyroResult<Self> {
         constraints.validate().map_err(KyroError::from)?;
 
         let created_at = Instant::now();
         let timeout = Duration::from_millis(constraints.max_duration_ms);
-        let deadline = created_at
+        let computed_deadline = created_at
             .checked_add(timeout)
             .ok_or_else(|| KyroError::Validation(crate::error::ValidationError::InvalidSimulationConstraints {
                 reason: "max_duration_ms overflow".to_string(),
             }))?;
 
+        let deadline = match deadline_cap {
+            None => computed_deadline,
+            Some(cap) => if computed_deadline < cap { computed_deadline } else { cap },
+        };
+
+        let remaining_depth = constraints.max_depth.saturating_sub(nesting_level);
+
         Ok(Self {
             id: SimulationId::new(),
             constraints,
+            nesting_level,
+            remaining_depth,
             created_at,
             deadline,
             hypothetical_count: AtomicUsize::new(0),
@@ -126,6 +148,38 @@ impl SimulationContext {
             delta_store: DeltaStore::new(base, constraints),
             delta_index: DeltaVectorIndex::new(),
         })
+    }
+
+    /// Spawn a child simulation layered on top of this simulation.
+    ///
+    /// The child sees this simulation's hypotheticals (and base state), but any
+    /// child writes are isolated to the child's own overlay and cannot mutate the
+    /// parent overlay.
+    pub fn spawn_child(&self) -> KyroResult<Self> {
+        self.ensure_not_expired()?;
+
+        if self.remaining_depth < 1 {
+            // nesting_level = max_depth - remaining_depth
+            // actual_value reports the attempted nesting level (current + 1).
+            let nesting_level = self
+                .constraints
+                .max_depth
+                .saturating_sub(self.remaining_depth);
+            return Err(KyroError::Execution(ExecutionError::SimulationLimitExceeded {
+                limit_type: "nesting_depth".to_string(),
+                max_value: self.constraints.max_depth as u64,
+                actual_value: nesting_level.saturating_add(1) as u64,
+            }));
+        }
+
+        let base = SimulationBaseStores {
+            entities: self.delta_store.entities(),
+            beliefs: self.delta_store.beliefs(),
+            patterns: self.delta_store.patterns(),
+            conflicts: self.delta_store.conflicts(),
+        };
+
+        Self::new_internal(base, self.constraints, self.nesting_level + 1, Some(self.deadline))
     }
 
     /// Returns the constraints for this simulation.
@@ -165,11 +219,11 @@ impl SimulationContext {
         let current = self.hypothetical_count.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Cap the total number of hypotheticals as a conservative proxy.
-        // Derived from max_affected_entities * max_depth.
+        // Derived from max_affected_entities * remaining_depth.
         let max_ops = self
             .constraints
             .max_affected_entities
-            .saturating_mul(self.constraints.max_depth)
+            .saturating_mul(self.remaining_depth)
             .max(1);
 
         if current > max_ops {
@@ -287,7 +341,16 @@ impl Drop for SimulationContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use std::sync::Arc;
+
+    use crate::belief::ConsistencyStatus;
+    use crate::confidence::Confidence;
+    use crate::entity::{Entity, EntityType};
+    use crate::source::Source;
+    use crate::storage::EntityStore;
+    use crate::time::TimeRange;
+    use crate::value::Value;
 
     #[test]
     fn context_enforces_timeout() {
@@ -347,5 +410,145 @@ mod tests {
         let KyroError::Execution(ExecutionError::SimulationLimitExceeded { .. }) = err else {
             panic!("expected SimulationLimitExceeded, got {err:?}");
         };
+    }
+
+    #[test]
+    fn child_sees_parent_hypotheticals_but_writes_do_not_leak_up() {
+        let stores = crate::storage::InMemoryStores::default();
+        let entity = Entity::new("e", EntityType::Concept);
+        let entity_id = entity.id;
+        stores.entities.insert(entity).unwrap();
+
+        let base = SimulationBaseStores {
+            entities: Arc::new(stores.entities),
+            beliefs: Arc::new(stores.beliefs),
+            patterns: Arc::new(stores.patterns),
+            conflicts: Arc::new(stores.conflicts),
+        };
+
+        let parent = SimulationContext::new(
+            base,
+            SimulateConstraints {
+                max_affected_entities: 10,
+                max_depth: 3,
+                max_duration_ms: 500,
+            },
+        )
+        .unwrap();
+
+        let t0 = Utc::now();
+        let b_parent = Belief {
+            id: BeliefId::new(),
+            subject: entity_id,
+            predicate: "p".to_string(),
+            value: Value::Int(1),
+            confidence: Confidence::from_agent(0.9, "sim").unwrap(),
+            source: Source::Unknown { description: None },
+            valid_time: TimeRange::starting_at(t0),
+            tx_time: t0,
+            reason: None,
+            consistency_status: ConsistencyStatus::Provisional,
+            supersedes: None,
+            superseded_by: None,
+            embedding: None,
+        };
+
+        parent.assert_hypothetical(b_parent.clone()).unwrap();
+        assert!(parent.delta_store.beliefs().get(b_parent.id).unwrap().is_some());
+
+        let child = parent.spawn_child().unwrap();
+
+        // Child can read parent's hypotheticals through its base view.
+        assert!(child.delta_store.beliefs().get(b_parent.id).unwrap().is_some());
+
+        // Child writes remain isolated to the child.
+        let t1 = t0 + chrono::Duration::milliseconds(1);
+        let b_child = Belief {
+            id: BeliefId::new(),
+            subject: entity_id,
+            predicate: "q".to_string(),
+            value: Value::Bool(true),
+            confidence: Confidence::from_agent(0.8, "sim").unwrap(),
+            source: Source::Unknown { description: None },
+            valid_time: TimeRange::starting_at(t1),
+            tx_time: t1,
+            reason: None,
+            consistency_status: ConsistencyStatus::Provisional,
+            supersedes: None,
+            superseded_by: None,
+            embedding: None,
+        };
+
+        child.assert_hypothetical(b_child.clone()).unwrap();
+        assert!(child.delta_store.beliefs().get(b_child.id).unwrap().is_some());
+        assert!(parent.delta_store.beliefs().get(b_child.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn child_op_budget_shrinks_with_depth() {
+        let stores = crate::storage::InMemoryStores::default();
+        let entity = Entity::new("e", EntityType::Concept);
+        stores.entities.insert(entity).unwrap();
+
+        let base = SimulationBaseStores {
+            entities: Arc::new(stores.entities),
+            beliefs: Arc::new(stores.beliefs),
+            patterns: Arc::new(stores.patterns),
+            conflicts: Arc::new(stores.conflicts),
+        };
+
+        // max_ops(parent)=1*2=2, max_ops(child)=1*1=1
+        let parent = SimulationContext::new(
+            base,
+            SimulateConstraints {
+                max_affected_entities: 1,
+                max_depth: 2,
+                max_duration_ms: 500,
+            },
+        )
+        .unwrap();
+
+        let child = parent.spawn_child().unwrap();
+        child.register_hypothetical().unwrap();
+
+        let err = child.register_hypothetical().unwrap_err();
+        let KyroError::Execution(ExecutionError::SimulationLimitExceeded { limit_type, .. }) = err else {
+            panic!("expected SimulationLimitExceeded, got {err:?}");
+        };
+        assert_eq!(limit_type, "hypothetical_count");
+    }
+
+    #[test]
+    fn child_deadline_is_capped_by_parent_deadline() {
+        let stores = crate::storage::InMemoryStores::default();
+        let entity = Entity::new("e", EntityType::Concept);
+        stores.entities.insert(entity).unwrap();
+
+        let base = SimulationBaseStores {
+            entities: Arc::new(stores.entities),
+            beliefs: Arc::new(stores.beliefs),
+            patterns: Arc::new(stores.patterns),
+            conflicts: Arc::new(stores.conflicts),
+        };
+
+        let parent = SimulationContext::new(
+            base,
+            SimulateConstraints {
+                max_affected_entities: 10,
+                max_depth: 3,
+                max_duration_ms: 20,
+            },
+        )
+        .unwrap();
+
+        let child = parent.spawn_child().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        let parent_err = parent.ensure_not_expired().unwrap_err();
+        assert!(matches!(parent_err, KyroError::Execution(ExecutionError::Timeout { .. })));
+
+        let child_err = child.ensure_not_expired().unwrap_err();
+        assert!(matches!(child_err, KyroError::Execution(ExecutionError::Timeout { .. })));
     }
 }

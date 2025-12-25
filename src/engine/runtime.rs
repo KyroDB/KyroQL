@@ -425,4 +425,39 @@ mod tests {
         // Ensure the reflection sleep job completes too.
         sleep.recv_timeout(Duration::from_secs(1)).unwrap();
     }
+
+    #[test]
+    fn join_reports_disconnected_when_reply_sender_dropped() {
+        let (_tx, rx) = bounded::<KyroResult<EngineResponse>>(1);
+        // Drop sender without sending, so recv() must see Disconnected.
+        drop(_tx);
+
+        let handle = ExecutionHandle {
+            path: ExecutionPath::Reflex,
+            rx,
+        };
+
+        let err = handle.join().unwrap_err();
+        let KyroError::Execution(ExecutionError::Disconnected { path }) = err else {
+            panic!("expected Disconnected, got {err:?}");
+        };
+        assert_eq!(path, "reflex");
+    }
+
+    #[test]
+    fn join_timeout_reports_disconnected_not_timeout_when_reply_sender_dropped() {
+        let (_tx, rx) = bounded::<KyroResult<EngineResponse>>(1);
+        drop(_tx);
+
+        let handle = ExecutionHandle {
+            path: ExecutionPath::Reflection,
+            rx,
+        };
+
+        let err = handle.join_timeout(Duration::from_millis(10)).unwrap_err();
+        let KyroError::Execution(ExecutionError::Disconnected { path }) = err else {
+            panic!("expected Disconnected, got {err:?}");
+        };
+        assert_eq!(path, "reflection");
+    }
 }

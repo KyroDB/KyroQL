@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant};
+use std::{fs::OpenOptions, io::Write};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
+use serde_json::json;
 
 use kyroql::{
     AssertBuilder, Confidence, ConsistencyMode, Entity, EntityType, EngineResponse, KyroEngine,
@@ -23,6 +26,41 @@ fn ops_per_sec(ops: usize, elapsed: Duration) -> f64 {
         return f64::INFINITY;
     }
     (ops as f64) / elapsed.as_secs_f64()
+}
+
+fn resolve_workspace_target_dir() -> Option<PathBuf> {
+    // Cargo may place `target/` at the workspace root (one or more parents above the crate).
+    // Prefer an existing target dir, walking up a few levels.
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for _ in 0..6 {
+        let candidate = dir.join("target");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn resolve_perf_out_path(raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+
+    // Special-case `target/...` so it follows the actual cargo target directory.
+    let mut components = p.components();
+    if matches!(components.next(), Some(Component::Normal(c)) if c == "target") {
+        let rest: PathBuf = components.collect();
+        if let Some(target_dir) = resolve_workspace_target_dir() {
+            return target_dir.join(rest);
+        }
+    }
+
+    // Fallback: relative to crate dir.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(p)
 }
 
 /// Vision performance targets are only meaningful in release builds.
@@ -62,19 +100,42 @@ fn vision_perf_targets_report() {
         },
     );
 
-    // Seed: a single belief so RESOLVE does real work.
-    let seed = AssertBuilder::new()
-        .entity(entity_id)
-        .predicate("temperature")
-        .value(Value::Float(21.0))
-        .confidence(Confidence::from_agent(0.95, "perf").unwrap())
-        .source(Source::Unknown { description: None })
-        .valid_time(TimeRange::from_now())
-        .consistency_mode(ConsistencyMode::Force)
-        .build()
-        .unwrap();
+    // Seed beliefs so RESOLVE does non-trivial work.
+    for i in 0..256u32 {
+        let seed = AssertBuilder::new()
+            .entity(entity_id)
+            .predicate("temperature")
+            .value(Value::Float(20.0 + f64::from(i) * 0.01))
+            .confidence(Confidence::from_agent(0.95, "perf").unwrap())
+            .source(Source::Unknown { description: None })
+            .valid_time(TimeRange::from_now())
+            .consistency_mode(ConsistencyMode::Force)
+            .build()
+            .unwrap();
+        let _ = runtime.execute(seed).unwrap();
+    }
 
-    let _ = runtime.execute(seed).unwrap();
+    let out_path = std::env::var("KYRO_PERF_OUT").ok();
+    let mut out_file = out_path.as_deref().map(|raw| {
+        let path = resolve_perf_out_path(raw);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("failed to create perf output dir {}: {e}", parent.display()));
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("failed to open KYRO_PERF_OUT={raw} (resolved {}): {e}", path.display()))
+    });
+
+    let emit = |v: serde_json::Value, out_file: &mut Option<std::fs::File>| {
+        let line = v.to_string();
+        println!("{line}");
+        if let Some(f) = out_file.as_mut() {
+            writeln!(f, "{line}").expect("write perf evidence");
+        }
+    };
 
     // ---------------------
     // Reflex RESOLVE latency
@@ -92,7 +153,10 @@ fn vision_perf_targets_report() {
         let _ = runtime.execute(resolve_ir.clone()).unwrap();
     }
 
-    let iterations = 20_000usize;
+    let iterations = std::env::var("KYRO_PERF_RESOLVE_ITERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20_000usize);
     let mut resolve_latencies = Vec::with_capacity(iterations);
     let start_all = Instant::now();
     for _ in 0..iterations {
@@ -109,7 +173,15 @@ fn vision_perf_targets_report() {
     let p99_resolve = p99(&mut lat_copy);
     let resolve_rps = ops_per_sec(iterations, total);
 
-    println!("perf_targets: resolve_simple p99={:?} rps={:.0}", p99_resolve, resolve_rps);
+    emit(
+        json!({
+            "metric": "resolve_simple",
+            "p99_ns": p99_resolve.as_nanos(),
+            "rps": resolve_rps,
+            "iters": iterations,
+        }),
+        &mut out_file,
+    );
 
     // -----------------
     // ASSERT throughput
@@ -131,7 +203,10 @@ fn vision_perf_targets_report() {
         let _ = runtime.execute(assert_ir.clone()).unwrap();
     }
 
-    let assert_iters = 10_000usize;
+    let assert_iters = std::env::var("KYRO_PERF_ASSERT_ITERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(10_000usize);
     let start_assert = Instant::now();
     for _ in 0..assert_iters {
         let resp = runtime.execute(assert_ir.clone()).unwrap();
@@ -142,7 +217,14 @@ fn vision_perf_targets_report() {
     let assert_total = start_assert.elapsed();
     let assert_rps = ops_per_sec(assert_iters, assert_total);
 
-    println!("perf_targets: assert_force rps={:.0}", assert_rps);
+    emit(
+        json!({
+            "metric": "assert_force",
+            "rps": assert_rps,
+            "iters": assert_iters,
+        }),
+        &mut out_file,
+    );
 
     // Optional enforcement (machine-dependent).
     if std::env::var("KYRO_ENFORCE_VISION_PERF").ok().as_deref() == Some("1") {

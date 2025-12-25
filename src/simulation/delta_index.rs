@@ -208,4 +208,14 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, b);
     }
+
+    #[test]
+    fn search_respects_zero_limit() {
+        let mut idx = DeltaVectorIndex::new();
+        let id = BeliefId::new();
+        idx.upsert(id, &[1.0, 0.0, 0.0], 0.9).unwrap();
+
+        let hits = idx.search(&[1.0, 0.0, 0.0], 0, None).unwrap();
+        assert!(hits.is_empty());
+    }
 }

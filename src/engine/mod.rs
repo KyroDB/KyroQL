@@ -21,7 +21,9 @@ use crate::entity::{EntityId};
 use crate::error::{ExecutionError, KyroError, KyroResult, ValidationError};
 use crate::frame::{BeliefFrame, Evidence, KnowledgeGap, RankedClaim};
 use crate::inference::{apply_conflict_policy, ConflictResolutionPolicy, PolicyDecision};
-use crate::ir::{ConsistencyMode, DefinePatternPayload, KyroIR, Operation, ResolvePayload, RetractPayload, SimulatePayload};
+use crate::ir::{ConsistencyMode, DefinePatternPayload, KyroIR, MonitorPayload, Operation, ResolvePayload, RetractPayload, SimulatePayload};
+use crate::monitor::{MonitorRegistration, MonitorSystem, MonitorSystemConfig};
+use crate::monitor::matcher::AssertObservation;
 use crate::pattern::{Pattern, PatternId, PatternRule};
 use crate::simulation::{SimulateConstraints, SimulationBaseStores, SimulationContext};
 use crate::storage::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
@@ -67,7 +69,7 @@ fn cached_regex(pattern: &str) -> KyroResult<regex::Regex> {
 }
 
 /// Result of executing a KyroQL operation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum EngineResponse {
     /// Result of an ASSERT.
     Assert {
@@ -100,6 +102,12 @@ pub enum EngineResponse {
         /// The created simulation context.
         simulation: Arc<SimulationContext>,
     },
+
+    /// Result of a MONITOR registration.
+    Monitor {
+        /// The created registration (includes event stream).
+        registration: MonitorRegistration,
+    },
 }
 
 /// KyroQL execution engine.
@@ -109,6 +117,7 @@ pub struct KyroEngine {
     beliefs: Arc<dyn BeliefStore>,
     patterns: Arc<dyn PatternStore>,
     conflicts: Arc<dyn ConflictStore>,
+    monitor: Arc<MonitorSystem>,
 }
 
 impl KyroEngine {
@@ -120,11 +129,16 @@ impl KyroEngine {
         patterns: Arc<dyn PatternStore>,
         conflicts: Arc<dyn ConflictStore>,
     ) -> Self {
+        let monitor = Arc::new(MonitorSystem::new(
+            MonitorSystemConfig::default(),
+            Arc::clone(&beliefs),
+        ));
         Self {
             entities,
             beliefs,
             patterns,
             conflicts,
+            monitor,
         }
     }
 
@@ -138,15 +152,27 @@ impl KyroEngine {
             Operation::Assert(payload) => self.execute_assert(ir.timestamp, payload.consistency_mode, payload.entity_id, payload.predicate, payload.value, payload.confidence, payload.source, payload.valid_time, payload.embedding),
             Operation::Resolve(payload) => self.execute_resolve(payload),
             Operation::Simulate(payload) => self.execute_simulate(payload),
-            Operation::Monitor(_) => Err(KyroError::Execution(ExecutionError::NotImplemented {
-                operation: "monitor".to_string(),
-            })),
+            Operation::Monitor(payload) => self.execute_monitor(payload),
             Operation::Derive(_) => Err(KyroError::Execution(ExecutionError::NotImplemented {
                 operation: "derive".to_string(),
             })),
             Operation::Retract(payload) => self.execute_retract(ir.timestamp, payload),
             Operation::DefinePattern(payload) => self.execute_define_pattern(payload),
         }
+    }
+
+    fn execute_monitor(&self, payload: MonitorPayload) -> KyroResult<EngineResponse> {
+        let threshold = payload.threshold.unwrap_or(Value::Null);
+
+        let triggers = self.monitor.triggers_from_threshold_value(
+            &threshold,
+            payload.entity_filter.as_deref(),
+            payload.predicates.as_deref(),
+            payload.pattern_filter.as_deref(),
+        )?;
+
+        let registration = self.monitor.register(triggers, payload.expires_at)?;
+        Ok(EngineResponse::Monitor { registration })
     }
 
     fn execute_simulate(&self, payload: SimulatePayload) -> KyroResult<EngineResponse> {
@@ -255,6 +281,17 @@ impl KyroEngine {
 
         if mode.is_force() {
             self.beliefs.insert(belief).map_err(Self::storage_err)?;
+
+            self.monitor.observe_assert(AssertObservation {
+                tx_time,
+                belief_id,
+                entity_id,
+                predicate: predicate.clone(),
+                value: value.clone(),
+                confidence: confidence.value(),
+                conflict_types: Vec::new(),
+            });
+
             return Ok(EngineResponse::Assert {
                 belief_id,
                 conflict_ids: Vec::new(),
@@ -276,6 +313,17 @@ impl KyroEngine {
         if conflicts.is_empty() {
             belief.consistency_status = ConsistencyStatus::Verified;
             self.beliefs.insert(belief).map_err(Self::storage_err)?;
+
+            self.monitor.observe_assert(AssertObservation {
+                tx_time,
+                belief_id,
+                entity_id,
+                predicate: predicate.clone(),
+                value: value.clone(),
+                confidence: confidence.value(),
+                conflict_types: Vec::new(),
+            });
+
             return Ok(EngineResponse::Assert {
                 belief_id,
                 conflict_ids: Vec::new(),
@@ -298,6 +346,19 @@ impl KyroEngine {
             conflict_ids: conflict_ids.clone(),
         };
         self.beliefs.insert(belief).map_err(Self::storage_err)?;
+
+        let conflict_types: Vec<crate::conflict::ConflictType> =
+            conflicts.iter().map(|c| c.conflict_type.clone()).collect();
+
+        self.monitor.observe_assert(AssertObservation {
+            tx_time,
+            belief_id,
+            entity_id,
+            predicate: predicate.clone(),
+            value: value.clone(),
+            confidence: confidence.value(),
+            conflict_types,
+        });
 
         Ok(EngineResponse::Assert {
             belief_id,

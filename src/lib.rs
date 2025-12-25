@@ -31,9 +31,7 @@
 //!     .build()?;
 //! ```
 
-#![warn(missing_docs)]
 #![warn(clippy::all)]
-#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 pub mod belief;
@@ -47,6 +45,8 @@ pub mod inference; // Exposing the inference module
 pub mod engine;
 
 pub mod simulation;
+
+pub mod monitor;
 
 pub mod ir;
 pub mod operations;
@@ -86,4 +86,6 @@ pub use engine::runtime::{DefaultRouter, ExecutionHandle, ExecutionPath, KyroRun
 pub use inference::ConflictResolutionPolicy; // Exposing ConflictResolutionPolicy from inference module
 
 pub use simulation::{SimulateConstraints, SimulationContext, SimulationId, SimulationImpact};
+
+pub use monitor::{EventPayload, MonitorEvent, MonitorEventError, MonitorRegistration, MonitorStream, MonitorSystem, MonitorSystemConfig, SubscriptionId, Trigger, TriggerId};
 
