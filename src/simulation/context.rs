@@ -32,7 +32,7 @@ fn storage_err(err: StorageError) -> KyroError {
 }
 
 /// Summary of changes within a simulation overlay.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimulationImpact {
     /// Unique entities affected by the simulation.
     pub affected_entities: Vec<EntityId>,
@@ -47,7 +47,7 @@ pub struct SimulationImpact {
 }
 
 /// Result of committing a simulation overlay into base storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimulationCommitResult {
     /// How many overlay beliefs were committed.
     pub committed_beliefs: usize,

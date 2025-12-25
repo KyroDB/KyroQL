@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package kyroql;
+
+// KyroQL gRPC transport schema.
+//
+// Design principle: do NOT invent a parallel data model.
+//
+// The canonical protocol surface is KyroIR (see docs/IMPLEMENTATION_PLAN.md and src/ir/operations.rs).
+// This transport therefore carries JSON for KyroIR and JSON for responses/events.
+//
+// Benefits:
+// - Perfect alignment with the implemented data model (serde + validation invariants).
+// - Forward/backward compatibility via KyroIR.version.
+// - Avoids unstable/incorrect ad-hoc string enums.
+//
+// Tradeoff:
+// - JSON parsing cost. This is acceptable for correctness-first server bring-up.
+//   We can later add typed protobuf messages once the open standard is frozen.
+
+message ExecuteRequest {
+  // UTF-8 JSON encoding of `kyroql::KyroIR`.
+  bytes ir_json = 1;
+}
+
+message ExecuteResponse {
+  // UTF-8 JSON encoding of a transport response object.
+  //
+  // The response is not `EngineResponse` directly because some in-process handles
+  // (e.g. SimulationContext, MonitorRegistration) are not serializable across the network.
+  bytes response_json = 1;
+}
+
+message MonitorRequest {
+  // UTF-8 JSON encoding of `kyroql::KyroIR` with `op = "monitor"`.
+  bytes ir_json = 1;
+}
+
+message MonitorEvent {
+  // UTF-8 JSON encoding of `kyroql::MonitorEvent`.
+  bytes event_json = 1;
+}
+
+message SimulateCreateRequest {
+  // UTF-8 JSON encoding of `kyroql::KyroIR` with `op = "simulate"`.
+  bytes ir_json = 1;
+}
+
+message SimulateCreateResponse {
+  // String form of SimulationId (UUID).
+  string simulation_id = 1;
+}
+
+message SimulateExecuteRequest {
+  // String form of SimulationId (UUID).
+  string simulation_id = 1;
+  // UTF-8 JSON encoding of `kyroql::KyroIR`.
+  // Supported ops inside simulation are: assert, resolve, derive.
+  bytes ir_json = 2;
+}
+
+message SimulateExecuteResponse {
+  // UTF-8 JSON encoding of a transport response object.
+  bytes response_json = 1;
+}
+
+message SimulateImpactRequest {
+  string simulation_id = 1;
+}
+
+message SimulateImpactResponse {
+  // UTF-8 JSON encoding of `kyroql::SimulationImpact`.
+  bytes impact_json = 1;
+}
+
+message SimulateCommitRequest {
+  string simulation_id = 1;
+  // UTF-8 string; matches KyroIR ConsistencyMode serde values.
+  string consistency_mode = 2;
+}
+
+message SimulateCommitResponse {
+  // UTF-8 JSON encoding of `kyroql::SimulationCommitResult`.
+  bytes commit_json = 1;
+}
+
+message SimulateCloseRequest {
+  string simulation_id = 1;
+}
+
+message SimulateCloseResponse {
+  bool closed = 1;
+}
+
+service KyroService {
+  // Execute a non-streaming KyroIR operation.
+  //
+  // Supported operations: assert, resolve, retract, define_pattern, derive.
+  //
+  // Not supported via Execute:
+  // - monitor (use Monitor RPC)
+  // - simulate (use SimulateCreate + SimulateExecute)
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Register a monitor and stream fired events.
+  rpc Monitor(MonitorRequest) returns (stream MonitorEvent);
+
+  // Create a simulation context and return its ID.
+  rpc SimulateCreate(SimulateCreateRequest) returns (SimulateCreateResponse);
+
+  // Execute an operation inside an existing simulation.
+  rpc SimulateExecute(SimulateExecuteRequest) returns (SimulateExecuteResponse);
+
+  // Query the impact summary of a simulation.
+  rpc SimulateImpact(SimulateImpactRequest) returns (SimulateImpactResponse);
+
+  // Commit a root simulation overlay into base stores.
+  rpc SimulateCommit(SimulateCommitRequest) returns (SimulateCommitResponse);
+
+  // Close and drop a simulation.
+  rpc SimulateClose(SimulateCloseRequest) returns (SimulateCloseResponse);
+}

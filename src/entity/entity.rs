@@ -178,6 +178,14 @@ impl fmt::Display for EntityType {
     }
 }
 
+impl std::str::FromStr for EntityType {
+    type Err = String;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s.to_string())
+    }
+}
+
 /// The anchor of identity in KyroQL.
 ///
 /// All beliefs attach to entities via [`EntityId`]. An entity represents

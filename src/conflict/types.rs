@@ -342,6 +342,12 @@ impl Conflict {
     pub fn belief_count(&self) -> usize {
         self.belief_ids.len()
     }
+
+    /// Returns true if the given belief is involved in this conflict.
+    #[must_use]
+    pub fn involves_belief(&self, belief_id: BeliefId) -> bool {
+        self.belief_ids.contains(&belief_id)
+    }
 }
 
 impl PartialEq for Conflict {

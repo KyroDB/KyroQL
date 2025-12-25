@@ -156,6 +156,36 @@ impl KyroEngine {
             monitor,
         }
     }
+    
+    /// Get a reference to the entity store.
+    pub fn entity_store(&self) -> &Arc<dyn EntityStore> {
+        &self.entities
+    }
+    
+    /// Get a reference to the belief store.
+    pub fn belief_store(&self) -> &Arc<dyn BeliefStore> {
+        &self.beliefs
+    }
+    
+    /// Get a reference to the pattern store.
+    pub fn pattern_store(&self) -> &Arc<dyn PatternStore> {
+        &self.patterns
+    }
+    
+    /// Get a reference to the conflict store.
+    pub fn conflict_store(&self) -> &Arc<dyn ConflictStore> {
+        &self.conflicts
+    }
+    
+    /// Get a reference to the derivation store.
+    pub fn derivation_store(&self) -> &Arc<dyn DerivationStore> {
+        &self.derivations
+    }
+    
+    /// Get a reference to the monitor system.
+    pub fn monitor_system(&self) -> &Arc<MonitorSystem> {
+        &self.monitor
+    }
 
     /// Execute a KyroQL IR request.
     pub fn execute(&self, ir: KyroIR) -> KyroResult<EngineResponse> {

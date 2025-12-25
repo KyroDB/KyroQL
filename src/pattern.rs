@@ -239,6 +239,12 @@ impl PatternRule {
             Self::Custom { .. } => Vec::new(),
         }
     }
+
+    /// Returns true if this rule applies to the given predicate.
+    #[must_use]
+    pub fn matches_predicate(&self, predicate: &str) -> bool {
+        self.indexed_predicates().iter().any(|&p| p == predicate)
+    }
 }
 
 impl fmt::Display for PatternRule {

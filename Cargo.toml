@@ -32,12 +32,37 @@ thiserror = "1.0"
 # Bounded channels for runtime isolation/backpressure
 crossbeam-channel = "0.5"
 
+# CRC32 checksums for corruption detection (persistent storage)
+crc32fast = { version = "1.4", optional = true }
+
+# gRPC server (Tonic) (server-mode transport)
+tonic = { version = "0.12", optional = true }
+prost = { version = "0.13", optional = true }
+prost-types = { version = "0.13", optional = true }
+tokio = { version = "1.0", features = ["full"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
+# Unix file locking
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+# Windows file locking
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO"], optional = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+
 [dev-dependencies]
 # Testing
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
 
 # Allocation profiling (used by integration tests only)
 stats_alloc = "0.1"
+
+# Temporary directories for tests
+tempfile = "3.14"
 
 # Benchmarks
 criterion = "0.5"
@@ -46,8 +71,22 @@ criterion = "0.5"
 name = "phase2"
 harness = false
 
+[[bin]]
+name = "kyroql-server"
+path = "src/bin/kyroql_server.rs"
+required-features = ["server"]
+
 [features]
 default = []
+
+# Embedded durable storage backend (single-process, file lock, WAL)
+persistent = ["dep:crc32fast", "dep:libc", "dep:windows-sys"]
+
+# gRPC transport layer for server mode
+transport-grpc = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:tokio", "dep:tokio-stream"]
+
+# Full server binary (gRPC + persistent storage)
+server = ["persistent", "transport-grpc"]
 
 [lib]
 name = "kyroql"

@@ -35,6 +35,12 @@ impl fmt::Display for BeliefId {
     }
 }
 
+impl From<uuid::Uuid> for BeliefId {
+    fn from(uuid: uuid::Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
 /// Unique identifier for a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

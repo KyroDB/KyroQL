@@ -53,6 +53,9 @@ pub mod ir;
 pub mod operations;
 pub mod storage;
 
+#[cfg(feature = "transport-grpc")]
+pub mod transport;
+
 // Module aliases to preserve stable paths while matching the documented layout.
 pub use belief::{confidence, source, time, value};
 pub use operations::belief_frame as frame;
