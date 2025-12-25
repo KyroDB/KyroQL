@@ -18,6 +18,11 @@ pub const MAX_EMBEDDING_DIM: usize = 8192;
 /// Conservative upper bound for free-form text fields.
 pub const MAX_TEXT_LEN: usize = 16 * 1024;
 
+/// Conservative upper bounds for DERIVE payloads.
+pub const MAX_DERIVATION_SOURCES: usize = 1024;
+pub const MAX_DERIVATION_STEPS: usize = 256;
+pub const MAX_DERIVATION_METADATA_BYTES: usize = 64 * 1024;
+
 /// Validate a non-empty trimmed string field.
 fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ValidationError> {
     let v = value.trim();
@@ -137,7 +142,65 @@ impl MonitorPayload {
 impl DerivePayload {
     /// Validates this payload.
     pub fn validate(&self) -> Result<(), ValidationError> {
-        validate_optional_text("rule", &self.rule)?;
+        let Some(rule) = &self.rule else {
+            return Err(ValidationError::MissingField {
+                field: "rule".to_string(),
+            });
+        };
+        validate_non_empty("rule", rule)?;
+
+        let Some(sources) = &self.sources else {
+            return Err(ValidationError::MissingField {
+                field: "sources".to_string(),
+            });
+        };
+        if sources.is_empty() {
+            return Err(ValidationError::MissingField {
+                field: "sources".to_string(),
+            });
+        }
+        if sources.len() > MAX_DERIVATION_SOURCES {
+            return Err(ValidationError::FieldTooLong {
+                field: "sources".to_string(),
+                max_length: MAX_DERIVATION_SOURCES,
+            });
+        }
+
+        if let Some(derived) = self.derived_belief_id {
+            if sources.iter().any(|id| *id == derived) {
+                return Err(ValidationError::InvalidField {
+                    field: "derived_belief_id".to_string(),
+                    reason: "must not appear in sources".to_string(),
+                });
+            }
+        }
+
+        if let Some(steps) = &self.inference_steps {
+            if steps.len() > MAX_DERIVATION_STEPS {
+                return Err(ValidationError::FieldTooLong {
+                    field: "inference_steps".to_string(),
+                    max_length: MAX_DERIVATION_STEPS,
+                });
+            }
+            for step in steps {
+                validate_non_empty("inference_steps", step)?;
+            }
+        }
+
+        validate_confidence_range(&self.confidence)?;
+        validate_optional_text("justification", &self.justification)?;
+        if let Some(meta) = &self.metadata {
+            let bytes = serde_json::to_vec(meta).map_err(|e| ValidationError::InvalidField {
+                field: "metadata".to_string(),
+                reason: format!("failed to serialize metadata: {e}"),
+            })?;
+            if bytes.len() > MAX_DERIVATION_METADATA_BYTES {
+                return Err(ValidationError::FieldTooLong {
+                    field: "metadata".to_string(),
+                    max_length: MAX_DERIVATION_METADATA_BYTES,
+                });
+            }
+        }
         Ok(())
     }
 }

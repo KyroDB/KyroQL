@@ -11,9 +11,12 @@ use chrono::{DateTime, Duration, Utc};
 use crate::belief::Belief;
 use crate::confidence::BeliefId;
 use crate::conflict::{Conflict, ConflictId, ConflictStatus};
+use crate::derivation::{DerivationId, DerivationRecord};
 use crate::entity::{Entity, EntityId};
 use crate::pattern::{Pattern, PatternId};
-use crate::storage::traits::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
+use crate::storage::traits::{
+    BeliefStore, ConflictStore, DerivationStore, EntityStore, PatternStore, StorageError,
+};
 use crate::time::TimeRange;
 
 fn lock_err(context: &'static str) -> StorageError {
@@ -865,6 +868,99 @@ pub struct InMemoryPatternStore {
     state: RwLock<PatternState>,
 }
 
+#[derive(Debug, Default)]
+struct DerivationState {
+    by_id: HashMap<DerivationId, DerivationRecord>,
+    by_premise: HashMap<BeliefId, HashSet<DerivationId>>,
+    by_derived: HashMap<BeliefId, HashSet<DerivationId>>,
+}
+
+/// In-memory derivation store.
+#[derive(Debug, Default)]
+pub struct InMemoryDerivationStore {
+    state: RwLock<DerivationState>,
+}
+
+impl InMemoryDerivationStore {
+    /// Create a new in-memory derivation store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl DerivationStore for InMemoryDerivationStore {
+    fn insert(&self, record: DerivationRecord) -> Result<(), StorageError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| lock_err("derivation.insert"))?;
+
+        if state.by_id.contains_key(&record.id) {
+            return Err(StorageError::DuplicateKey(format!(
+                "derivation:{}",
+                record.id
+            )));
+        }
+
+        let id = record.id;
+        for premise in &record.premise_ids {
+            state
+                .by_premise
+                .entry(*premise)
+                .or_default()
+                .insert(id);
+        }
+        if let Some(derived) = record.derived_belief_id {
+            state.by_derived.entry(derived).or_default().insert(id);
+        }
+
+        state.by_id.insert(id, record);
+        Ok(())
+    }
+
+    fn get(&self, id: DerivationId) -> Result<Option<DerivationRecord>, StorageError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| lock_err("derivation.get"))?;
+        Ok(state.by_id.get(&id).cloned())
+    }
+
+    fn find_by_premise(&self, premise_id: BeliefId) -> Result<Vec<DerivationRecord>, StorageError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| lock_err("derivation.find_by_premise"))?;
+        let Some(ids) = state.by_premise.get(&premise_id) else {
+            return Ok(Vec::new());
+        };
+
+        Ok(ids
+            .iter()
+            .filter_map(|id| state.by_id.get(id).cloned())
+            .collect())
+    }
+
+    fn find_by_derived_belief(
+        &self,
+        derived_belief_id: BeliefId,
+    ) -> Result<Vec<DerivationRecord>, StorageError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| lock_err("derivation.find_by_derived_belief"))?;
+        let Some(ids) = state.by_derived.get(&derived_belief_id) else {
+            return Ok(Vec::new());
+        };
+
+        Ok(ids
+            .iter()
+            .filter_map(|id| state.by_id.get(id).cloned())
+            .collect())
+    }
+}
+
 impl InMemoryPatternStore {
     /// Create a new empty store.
     #[must_use]
@@ -997,6 +1093,9 @@ pub struct InMemoryStores {
     pub patterns: InMemoryPatternStore,
     /// Conflict store.
     pub conflicts: InMemoryConflictStore,
+
+    /// Derivation store.
+    pub derivations: InMemoryDerivationStore,
 }
 
 impl InMemoryStores {
@@ -1013,7 +1112,8 @@ mod tests {
 
     use chrono::Duration;
 
-    use crate::confidence::Confidence;
+    use crate::confidence::{BeliefId, Confidence};
+    use crate::derivation::DerivationRecord;
     use crate::conflict::ConflictResolution;
     use crate::pattern::{MonotonicDirection, PatternRule};
     use crate::source::Source;
@@ -1070,6 +1170,118 @@ mod tests {
         assert!(store.get(id).unwrap().is_none());
         assert!(store.find_by_name("acme incorporated").unwrap().is_empty());
         assert!(matches!(store.delete(id), Err(StorageError::EntityNotFound(_))));
+    }
+
+    #[test]
+    fn derivation_insert_get_and_indexes() {
+        use chrono::Utc;
+
+        let store = InMemoryDerivationStore::new();
+        let p1 = BeliefId::new();
+        let p2 = BeliefId::new();
+        let derived = BeliefId::new();
+
+        let rec = DerivationRecord::new(
+            Utc::now(),
+            Some(derived),
+            vec![p1, p2],
+            "rule",
+            vec!["step".to_string()],
+            Some(0.8),
+            Some("justified".to_string()),
+            None,
+        )
+        .unwrap();
+        let id = rec.id;
+
+        store.insert(rec.clone()).unwrap();
+
+        let fetched = store.get(id).unwrap().unwrap();
+        assert_eq!(fetched, rec);
+
+        let by_p1 = store.find_by_premise(p1).unwrap();
+        let by_p2 = store.find_by_premise(p2).unwrap();
+        assert_eq!(by_p1.len(), 1);
+        assert_eq!(by_p1[0].id, id);
+        assert_eq!(by_p2.len(), 1);
+        assert_eq!(by_p2[0].id, id);
+
+        let by_derived = store.find_by_derived_belief(derived).unwrap();
+        assert_eq!(by_derived.len(), 1);
+        assert_eq!(by_derived[0].id, id);
+    }
+
+    #[test]
+    fn derivation_rejects_duplicates() {
+        use chrono::Utc;
+
+        let store = InMemoryDerivationStore::new();
+        let prem = vec![BeliefId::new()];
+        let rec = DerivationRecord::new(
+            Utc::now(),
+            None,
+            prem,
+            "rule",
+            vec!["s".to_string()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        store.insert(rec.clone()).unwrap();
+        assert!(matches!(store.insert(rec), Err(StorageError::DuplicateKey(_))));
+    }
+
+    #[test]
+    fn derivation_indexes_handle_shared_premises_and_absent_derived() {
+        use chrono::Utc;
+
+        let store = InMemoryDerivationStore::new();
+        let shared = BeliefId::new();
+        let derived = BeliefId::new();
+
+        let r1 = DerivationRecord::new(
+            Utc::now(),
+            Some(derived),
+            vec![shared],
+            "r1",
+            vec![],
+            Some(0.5),
+            None,
+            None,
+        )
+        .unwrap();
+        let r1_id = r1.id;
+        store.insert(r1).unwrap();
+
+        let r2 = DerivationRecord::new(
+            Utc::now(),
+            None,
+            vec![shared],
+            "r2",
+            vec!["s".to_string()],
+            None,
+            Some("because".to_string()),
+            Some(serde_json::json!({"k": "v"})),
+        )
+        .unwrap();
+        let r2_id = r2.id;
+        store.insert(r2).unwrap();
+
+        let by_shared = store.find_by_premise(shared).unwrap();
+        assert_eq!(by_shared.len(), 2);
+        let ids: std::collections::HashSet<_> = by_shared.into_iter().map(|r| r.id).collect();
+        assert!(ids.contains(&r1_id));
+        assert!(ids.contains(&r2_id));
+
+        let by_derived = store.find_by_derived_belief(derived).unwrap();
+        assert_eq!(by_derived.len(), 1);
+        assert_eq!(by_derived[0].id, r1_id);
+
+        // No derived index for records without derived_belief_id.
+        let empty = store.find_by_derived_belief(BeliefId::new()).unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

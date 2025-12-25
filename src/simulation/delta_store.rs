@@ -526,6 +526,31 @@ impl DeltaStore {
         Ok((entities, inserted_belief_ids, supersedes))
     }
 
+    /// Return a deterministic snapshot of the overlay beliefs.
+    ///
+    /// This is intended for "commit overlay" workflows that graduate a simulation's delta into
+    /// base storage. The returned values are derived solely from delta state and do not touch
+    /// base stores.
+    pub fn overlay_snapshot(&self) -> Result<(Vec<Belief>, Vec<(BeliefId, BeliefId)>), StorageError> {
+        let state = match self.beliefs.state.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let mut beliefs: Vec<Belief> = state.inserted.values().cloned().collect();
+        beliefs.sort_by(|a, b| a.id.to_string().cmp(&b.id.to_string()));
+
+        let mut supersedes: Vec<(BeliefId, BeliefId)> = state.superseded.iter().map(|(o, n)| (*o, *n)).collect();
+        supersedes.sort_by(|(o1, n1), (o2, n2)| {
+            match o1.to_string().cmp(&o2.to_string()) {
+                std::cmp::Ordering::Equal => n1.to_string().cmp(&n2.to_string()),
+                other => other,
+            }
+        });
+
+        Ok((beliefs, supersedes))
+    }
+
     /// Clear all overlay state.
     pub fn clear(&mut self) {
         self.beliefs.clear();

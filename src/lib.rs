@@ -36,6 +36,7 @@
 
 pub mod belief;
 pub mod conflict;
+pub mod derivation;
 pub mod entity;
 pub mod embedding;
 pub mod error;
@@ -60,6 +61,7 @@ pub use operations::belief_frame as frame;
 pub use belief::{Belief, ConsistencyStatus};
 pub use confidence::{BeliefId, CalibrationMode, Confidence, ConfidenceSource, SourceId};
 pub use conflict::{Conflict, ConflictId, ConflictStatus, ConflictType};
+pub use derivation::{DerivationId, DerivationRecord};
 pub use entity::{Entity, EntityId, EntityType};
 pub use embedding::{lexical_embedding, DEFAULT_EMBEDDING_DIM};
 pub use error::{KyroError, ValidationError};
@@ -70,15 +72,17 @@ pub use time::TimeRange;
 pub use value::Value;
 
 pub use ir::{
-	AssertPayload, ConsistencyMode, DefinePatternPayload, KyroIR, Operation, ResolvePayload,
-	ResolveMode, RetractPayload,
+	AssertPayload, ConsistencyMode, DefinePatternPayload, DerivePayload, KyroIR, Operation,
+	ResolvePayload, ResolveMode, RetractPayload,
 };
-pub use operations::{AssertBuilder, ResolveBuilder};
+pub use operations::{AssertBuilder, DeriveBuilder, ResolveBuilder};
 pub use operations::SimulateBuilder;
-pub use storage::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
 pub use storage::{
-	InMemoryBeliefStore, InMemoryConflictStore, InMemoryEntityStore, InMemoryPatternStore,
-	InMemoryStores,
+    BeliefStore, ConflictStore, DerivationStore, EntityStore, PatternStore, StorageError,
+};
+pub use storage::{
+	InMemoryBeliefStore, InMemoryConflictStore, InMemoryDerivationStore, InMemoryEntityStore,
+	InMemoryPatternStore, InMemoryStores,
 };
 
 pub use engine::{EngineResponse, KyroEngine};

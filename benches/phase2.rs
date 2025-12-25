@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 use kyroql::{
-    AssertBuilder, Belief, BeliefStore, Confidence, ConsistencyMode, EntityStore, KyroEngine,
-    KyroRuntime, KyroRuntimeConfig, ResolveBuilder, ResolveMode, Source, TimeRange, Value,
+    AssertBuilder, Belief, BeliefStore, Confidence, ConsistencyMode, DeriveBuilder,
+    Entity, EntityStore, EntityType, KyroEngine, KyroRuntime, KyroRuntimeConfig, ResolveBuilder,
+    ResolveMode, SimulateBuilder, Source, TimeRange, Value,
 };
 
 fn make_engine_with_data() -> (KyroEngine, kyroql::EntityId) {
@@ -35,6 +36,7 @@ fn make_engine_with_data() -> (KyroEngine, kyroql::EntityId) {
         Arc::new(stores.beliefs),
         Arc::new(stores.patterns),
         Arc::new(stores.conflicts),
+        Arc::new(stores.derivations),
     );
 
     (engine, entity_id)
@@ -104,5 +106,94 @@ fn bench_reflex_resolve_simple(c: &mut Criterion) {
     });
 }
 
-criterion_group!(phase2, bench_reflex_assert_force, bench_reflex_resolve_simple);
+fn bench_derive_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("derive_throughput");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("derive_10_premises", |b| {
+        b.iter_custom(|iters| {
+            let stores = kyroql::InMemoryStores::new();
+            let e = Entity::new("BenchEntity", EntityType::Concept);
+            let eid = e.id;
+            stores.entities.insert(e).unwrap();
+
+            let engine = KyroEngine::new(
+                Arc::new(stores.entities),
+                Arc::new(stores.beliefs),
+                Arc::new(stores.patterns),
+                Arc::new(stores.conflicts),
+                Arc::new(stores.derivations),
+            );
+
+            let mut premises = Vec::new();
+            for _ in 0..10 {
+                let op = AssertBuilder::new()
+                    .entity(eid)
+                    .predicate("p")
+                    .value(Value::Bool(true))
+                    .confidence(Confidence::one())
+                    .source(Source::unknown_with_description("setup"))
+                    .valid_time(TimeRange::from_now())
+                    .build()
+                    .unwrap();
+                if let kyroql::EngineResponse::Assert { belief_id, .. } = engine.execute(op).unwrap() {
+                    premises.push(belief_id);
+                }
+            }
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                let op = DeriveBuilder::new()
+                    .rule("bench_rule")
+                    .sources(premises.clone())
+                    .confidence(0.9)
+                    .add_step("step1")
+                    .add_step("step2")
+                    .build()
+                    .unwrap();
+                engine.execute(op).unwrap();
+            }
+            start.elapsed()
+        })
+    });
+    group.finish();
+}
+
+fn bench_simulate_spawn(c: &mut Criterion) {
+    let mut group = c.benchmark_group("simulate_overhead");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("spawn_simulation", |b| {
+        b.iter_custom(|iters| {
+            let stores = kyroql::InMemoryStores::new();
+            let e = Entity::new("SimEntity", EntityType::Concept);
+            stores.entities.insert(e).unwrap();
+
+            let engine = KyroEngine::new(
+                Arc::new(stores.entities),
+                Arc::new(stores.beliefs),
+                Arc::new(stores.patterns),
+                Arc::new(stores.conflicts),
+                Arc::new(stores.derivations),
+            );
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                let op = SimulateBuilder::new().build().unwrap();
+                engine.execute(op).unwrap();
+            }
+            start.elapsed()
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    phase2,
+    bench_reflex_assert_force,
+    bench_reflex_resolve_simple,
+    bench_derive_throughput,
+    bench_simulate_spawn
+);
 criterion_main!(phase2);

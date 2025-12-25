@@ -20,6 +20,7 @@ fn make_runtime_with_entity() -> (kyroql::KyroRuntime, kyroql::EntityId) {
         Arc::new(stores.beliefs),
         Arc::new(stores.patterns),
         Arc::new(stores.conflicts),
+        Arc::new(stores.derivations),
     );
 
     let runtime = kyroql::KyroRuntime::new(

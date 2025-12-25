@@ -11,6 +11,11 @@ use super::triggers::{MonitorEvent, SubscriptionId};
 /// A subscription stream for monitor events.
 ///
 /// Dropping this stream attempts best-effort unregistration.
+///
+/// Note: `MonitorStream` intentionally does not implement `Clone`. Cloning a stream would
+/// create ambiguous and unsafe semantics (multiple consumers racing on the same underlying
+/// receiver and potential duplicate unregistration). See `docs/RELEASE_NOTES.md` (Unreleased,
+/// Breaking changes) and `docs/MIGRATION_GUIDE.md` for migration options.
 #[derive(Debug)]
 pub struct MonitorStream {
     subscription_id: SubscriptionId,

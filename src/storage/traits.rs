@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::belief::Belief;
 use crate::confidence::BeliefId;
 use crate::conflict::{Conflict, ConflictId};
+use crate::derivation::{DerivationId, DerivationRecord};
 use crate::entity::{Entity, EntityId};
 use crate::pattern::{Pattern, PatternId};
 use crate::time::TimeRange;
@@ -190,6 +191,26 @@ pub trait PatternStore: Send + Sync {
     fn find_active(&self) -> Result<Vec<Pattern>, StorageError>;
 }
 
+/// Storage trait for derivation records.
+///
+/// Derivations provide an audit trail linking premise beliefs to a derived belief.
+pub trait DerivationStore: Send + Sync {
+    /// Insert a new derivation record. Returns error if ID already exists.
+    fn insert(&self, record: DerivationRecord) -> Result<(), StorageError>;
+
+    /// Get a derivation record by ID.
+    fn get(&self, id: DerivationId) -> Result<Option<DerivationRecord>, StorageError>;
+
+    /// Find derivations that cite a given premise belief.
+    fn find_by_premise(&self, premise_id: BeliefId) -> Result<Vec<DerivationRecord>, StorageError>;
+
+    /// Find derivations that produced a given derived belief.
+    fn find_by_derived_belief(
+        &self,
+        derived_belief_id: BeliefId,
+    ) -> Result<Vec<DerivationRecord>, StorageError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +220,7 @@ mod tests {
     fn _assert_belief_store_object_safe(_: &dyn BeliefStore) {}
     fn _assert_conflict_store_object_safe(_: &dyn ConflictStore) {}
     fn _assert_pattern_store_object_safe(_: &dyn PatternStore) {}
+    fn _assert_derivation_store_object_safe(_: &dyn DerivationStore) {}
 
     #[test]
     fn test_storage_error_display() {

@@ -17,16 +17,22 @@ use chrono::{DateTime, Utc};
 use crate::belief::{Belief, ConsistencyStatus};
 use crate::confidence::{BeliefId, Confidence};
 use crate::conflict::{Conflict, ConflictId};
+use crate::derivation::{DerivationId, DerivationRecord};
 use crate::entity::{EntityId};
 use crate::error::{ExecutionError, KyroError, KyroResult, ValidationError};
 use crate::frame::{BeliefFrame, Evidence, KnowledgeGap, RankedClaim};
 use crate::inference::{apply_conflict_policy, ConflictResolutionPolicy, PolicyDecision};
-use crate::ir::{ConsistencyMode, DefinePatternPayload, KyroIR, MonitorPayload, Operation, ResolvePayload, RetractPayload, SimulatePayload};
+use crate::ir::{
+    ConsistencyMode, DefinePatternPayload, DerivePayload, KyroIR, MonitorPayload, Operation,
+    ResolvePayload, RetractPayload, SimulatePayload,
+};
 use crate::monitor::{MonitorRegistration, MonitorSystem, MonitorSystemConfig};
 use crate::monitor::matcher::AssertObservation;
 use crate::pattern::{Pattern, PatternId, PatternRule};
 use crate::simulation::{SimulateConstraints, SimulationBaseStores, SimulationContext};
-use crate::storage::{BeliefStore, ConflictStore, EntityStore, PatternStore, StorageError};
+use crate::storage::{
+    BeliefStore, ConflictStore, DerivationStore, EntityStore, PatternStore, StorageError,
+};
 use crate::time::TimeRange;
 use crate::value::Value;
 
@@ -108,6 +114,12 @@ pub enum EngineResponse {
         /// The created registration (includes event stream).
         registration: MonitorRegistration,
     },
+
+    /// Result of a DERIVE.
+    Derive {
+        /// The stored derivation record ID.
+        derivation_id: DerivationId,
+    },
 }
 
 /// KyroQL execution engine.
@@ -117,6 +129,7 @@ pub struct KyroEngine {
     beliefs: Arc<dyn BeliefStore>,
     patterns: Arc<dyn PatternStore>,
     conflicts: Arc<dyn ConflictStore>,
+    derivations: Arc<dyn DerivationStore>,
     monitor: Arc<MonitorSystem>,
 }
 
@@ -128,6 +141,7 @@ impl KyroEngine {
         beliefs: Arc<dyn BeliefStore>,
         patterns: Arc<dyn PatternStore>,
         conflicts: Arc<dyn ConflictStore>,
+        derivations: Arc<dyn DerivationStore>,
     ) -> Self {
         let monitor = Arc::new(MonitorSystem::new(
             MonitorSystemConfig::default(),
@@ -138,6 +152,7 @@ impl KyroEngine {
             beliefs,
             patterns,
             conflicts,
+            derivations,
             monitor,
         }
     }
@@ -153,12 +168,82 @@ impl KyroEngine {
             Operation::Resolve(payload) => self.execute_resolve(payload),
             Operation::Simulate(payload) => self.execute_simulate(payload),
             Operation::Monitor(payload) => self.execute_monitor(payload),
-            Operation::Derive(_) => Err(KyroError::Execution(ExecutionError::NotImplemented {
-                operation: "derive".to_string(),
-            })),
+            Operation::Derive(payload) => self.execute_derive(ir.timestamp, payload),
             Operation::Retract(payload) => self.execute_retract(ir.timestamp, payload),
             Operation::DefinePattern(payload) => self.execute_define_pattern(payload),
         }
+    }
+
+    fn execute_derive(&self, tx_time: DateTime<Utc>, payload: DerivePayload) -> KyroResult<EngineResponse> {
+        let rule = payload.rule.ok_or_else(|| KyroError::Validation(ValidationError::MissingField {
+            field: "rule".to_string(),
+        }))?;
+
+        let sources = payload.sources.ok_or_else(|| KyroError::Validation(ValidationError::MissingField {
+            field: "sources".to_string(),
+        }))?;
+
+        if sources.is_empty() {
+            return Err(KyroError::Validation(ValidationError::MissingField {
+                field: "sources".to_string(),
+            }));
+        }
+
+        // Deduplicate sources while preserving first-seen order.
+        let mut seen = std::collections::HashSet::<BeliefId>::with_capacity(sources.len());
+        let mut premise_ids = Vec::with_capacity(sources.len());
+        for id in sources {
+            if seen.insert(id) {
+                premise_ids.push(id);
+            }
+        }
+
+        if let Some(derived) = payload.derived_belief_id {
+            if premise_ids.iter().any(|p| *p == derived) {
+                return Err(KyroError::Execution(ExecutionError::InvalidDerivation {
+                    reason: "derived_belief_id must not appear in premise_ids".to_string(),
+                }));
+            }
+
+            let exists = self
+                .beliefs
+                .get(derived)
+                .map_err(Self::storage_err)?
+                .is_some();
+            if !exists {
+                return Err(KyroError::Execution(ExecutionError::BeliefNotFound { id: derived }));
+            }
+        }
+
+        for premise in &premise_ids {
+            let exists = self
+                .beliefs
+                .get(*premise)
+                .map_err(Self::storage_err)?
+                .is_some();
+            if !exists {
+                return Err(KyroError::Execution(ExecutionError::BeliefNotFound { id: *premise }));
+            }
+        }
+
+        let steps = payload.inference_steps.unwrap_or_default();
+
+        let record = DerivationRecord::new(
+            tx_time,
+            payload.derived_belief_id,
+            premise_ids,
+            rule,
+            steps,
+            payload.confidence,
+            payload.justification,
+            payload.metadata,
+        )
+        .map_err(KyroError::from)?;
+
+        let id = record.id;
+        self.derivations.insert(record).map_err(Self::storage_err)?;
+
+        Ok(EngineResponse::Derive { derivation_id: id })
     }
 
     fn execute_monitor(&self, payload: MonitorPayload) -> KyroResult<EngineResponse> {
@@ -1073,8 +1158,15 @@ mod tests {
         let beliefs = Arc::new(stores.beliefs);
         let patterns = Arc::new(stores.patterns);
         let conflicts = Arc::new(stores.conflicts);
+        let derivations = Arc::new(stores.derivations);
 
-        let eng = KyroEngine::new(entities.clone(), beliefs.clone(), patterns.clone(), conflicts.clone());
+        let eng = KyroEngine::new(
+            entities.clone(),
+            beliefs.clone(),
+            patterns.clone(),
+            conflicts.clone(),
+            derivations.clone(),
+        );
 
         let entity = Entity::new("LK-99", EntityType::Concept);
         let id = entity.id;
@@ -1088,25 +1180,103 @@ mod tests {
         KyroEngine,
         EntityId,
         Arc<crate::storage::memory::InMemoryBeliefStore>,
+        Arc<crate::storage::memory::InMemoryDerivationStore>,
     ) {
         let stores = InMemoryStores::new();
         let entities = Arc::new(stores.entities);
         let beliefs = Arc::new(stores.beliefs);
         let patterns = Arc::new(stores.patterns);
         let conflicts = Arc::new(stores.conflicts);
+        let derivations = Arc::new(stores.derivations);
 
         let eng = KyroEngine::new(
             entities.clone(),
             beliefs.clone(),
             patterns.clone(),
             conflicts.clone(),
+            derivations.clone(),
         );
 
         let entity = Entity::new("LK-99", EntityType::Concept);
         let id = entity.id;
         entities.insert(entity).unwrap();
 
-        (eng, id, beliefs)
+        (eng, id, beliefs, derivations)
+    }
+
+    #[test]
+    fn derive_persists_record_and_indexes_by_premise_and_derived() {
+        let (eng, id, _beliefs, derivations) = engine_with_backing_stores();
+
+        let p1 = KyroIR::new(Operation::Assert(crate::ir::AssertPayload {
+            entity_id: id,
+            predicate: "premise_a".to_string(),
+            value: Value::Bool(true),
+            confidence: Confidence::from_agent(0.9, "a").unwrap(),
+            source: Source::agent("a", Option::<String>::None),
+            valid_time: TimeRange::from_now(),
+            consistency_mode: ConsistencyMode::Force,
+            embedding: None,
+        }));
+        let EngineResponse::Assert { belief_id: b1, .. } = eng.execute(p1).unwrap() else {
+            panic!("expected assert");
+        };
+
+        let p2 = KyroIR::new(Operation::Assert(crate::ir::AssertPayload {
+            entity_id: id,
+            predicate: "premise_b".to_string(),
+            value: Value::Bool(true),
+            confidence: Confidence::from_agent(0.8, "a").unwrap(),
+            source: Source::agent("a", Option::<String>::None),
+            valid_time: TimeRange::from_now(),
+            consistency_mode: ConsistencyMode::Force,
+            embedding: None,
+        }));
+        let EngineResponse::Assert { belief_id: b2, .. } = eng.execute(p2).unwrap() else {
+            panic!("expected assert");
+        };
+
+        let derived_assert = KyroIR::new(Operation::Assert(crate::ir::AssertPayload {
+            entity_id: id,
+            predicate: "conclusion".to_string(),
+            value: Value::Bool(true),
+            confidence: Confidence::from_agent(0.7, "a").unwrap(),
+            source: Source::derived(vec![b1, b2], "modus_ponens"),
+            valid_time: TimeRange::from_now(),
+            consistency_mode: ConsistencyMode::Force,
+            embedding: None,
+        }));
+        let EngineResponse::Assert {
+            belief_id: derived_id,
+            ..
+        } = eng.execute(derived_assert).unwrap() else {
+            panic!("expected assert");
+        };
+
+        let derive_ir = KyroIR::new(Operation::Derive(DerivePayload {
+            rule: Some("modus_ponens".to_string()),
+            derived_belief_id: Some(derived_id),
+            sources: Some(vec![b1, b2]),
+            inference_steps: Some(vec!["if A then B".to_string()]),
+            confidence: Some(0.7),
+            justification: Some("A is true; therefore B".to_string()),
+            metadata: Some(serde_json::json!({"engine": "test"})),
+        }));
+
+        let EngineResponse::Derive { derivation_id } = eng.execute(derive_ir).unwrap() else {
+            panic!("expected derive");
+        };
+
+        let stored = derivations.get(derivation_id).unwrap().unwrap();
+        assert_eq!(stored.derived_belief_id, Some(derived_id));
+        assert_eq!(stored.premise_ids, vec![b1, b2]);
+        assert_eq!(stored.rule, "modus_ponens");
+
+        let by_premise = derivations.find_by_premise(b1).unwrap();
+        assert!(by_premise.iter().any(|r| r.id == derivation_id));
+
+        let by_derived = derivations.find_by_derived_belief(derived_id).unwrap();
+        assert!(by_derived.iter().any(|r| r.id == derivation_id));
     }
 
     #[test]
@@ -1363,7 +1533,7 @@ mod tests {
     fn retract_closes_old_belief_and_persists_retraction_state() {
         use chrono::Duration;
 
-        let (eng, id, belief_store) = engine_with_backing_stores();
+        let (eng, id, belief_store, _derivations) = engine_with_backing_stores();
 
         let t0 = Utc::now();
         let t1 = t0 + Duration::seconds(5);
@@ -1500,7 +1670,7 @@ mod tests {
 
     #[test]
     fn resolve_latest_wins_selects_newest_tx_time() {
-        let (eng, id, belief_store) = engine_with_backing_stores();
+        let (eng, id, belief_store, _derivations) = engine_with_backing_stores();
 
         let t0 = Utc::now();
         let old = Belief {

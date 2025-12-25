@@ -89,6 +89,7 @@ fn vision_perf_targets_report() {
         std::sync::Arc::new(stores.beliefs),
         std::sync::Arc::new(stores.patterns),
         std::sync::Arc::new(stores.conflicts),
+        std::sync::Arc::new(stores.derivations),
     );
 
     let runtime = KyroRuntime::new(

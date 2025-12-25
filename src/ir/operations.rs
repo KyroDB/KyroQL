@@ -368,6 +368,10 @@ pub struct DerivePayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
 
+    /// Optional derived belief to attach this derivation record to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_belief_id: Option<BeliefId>,
+
     /// Optional source belief identifiers that feed the derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<BeliefId>>,
@@ -392,6 +396,7 @@ pub struct DerivePayload {
 impl PartialEq for DerivePayload {
     fn eq(&self, other: &Self) -> bool {
         self.rule == other.rule
+            && self.derived_belief_id == other.derived_belief_id
             && self.sources == other.sources
             && self.inference_steps == other.inference_steps
             && opt_f32_approx_eq(&self.confidence, &other.confidence)

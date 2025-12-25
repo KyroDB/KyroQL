@@ -327,6 +327,7 @@ mod tests {
             Arc::new(stores.beliefs),
             Arc::new(stores.patterns),
             Arc::new(stores.conflicts),
+            Arc::new(stores.derivations),
         );
 
         let belief = Belief::builder()

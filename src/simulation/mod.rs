@@ -11,7 +11,7 @@ pub mod delta_index;
 pub mod delta_store;
 
 pub use constraints::SimulateConstraints;
-pub use context::{SimulationContext, SimulationId, SimulationImpact};
+pub use context::{SimulationCommitResult, SimulationContext, SimulationId, SimulationImpact};
 
 use std::sync::Arc;
 

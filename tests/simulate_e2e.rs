@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use kyroql::{
     AssertBuilder, Belief, Confidence, EngineResponse, Entity, EntityType, KyroEngine,
-    ResolveBuilder, SimulateBuilder, SimulateConstraints, Source, TimeRange, Value,
+    DeriveBuilder, DerivationStore, ResolveBuilder, SimulateBuilder, SimulateConstraints, Source,
+    TimeRange, Value,
 };
 
 use kyroql::{BeliefStore, EntityStore};
@@ -13,12 +14,14 @@ fn simulate_creates_isolated_overlay_and_does_not_mutate_base() {
     let beliefs = Arc::new(kyroql::InMemoryBeliefStore::default());
     let patterns = Arc::new(kyroql::InMemoryPatternStore::default());
     let conflicts = Arc::new(kyroql::InMemoryConflictStore::default());
+    let derivations = Arc::new(kyroql::InMemoryDerivationStore::default());
 
     let engine = KyroEngine::new(
         entities.clone(),
         beliefs.clone(),
         patterns.clone(),
         conflicts.clone(),
+        derivations.clone(),
     );
 
     let entity = Entity::new("sim_target", EntityType::Artifact);
@@ -104,4 +107,85 @@ fn simulate_creates_isolated_overlay_and_does_not_mutate_base() {
     // Still unchanged after simulation drops.
     let after = beliefs.count_by_entity(entity_id).unwrap();
     assert_eq!(after, after_assert);
+}
+
+#[test]
+fn simulate_can_record_derivations_without_mutating_base() {
+    let entities = Arc::new(kyroql::InMemoryEntityStore::default());
+    let beliefs = Arc::new(kyroql::InMemoryBeliefStore::default());
+    let patterns = Arc::new(kyroql::InMemoryPatternStore::default());
+    let conflicts = Arc::new(kyroql::InMemoryConflictStore::default());
+    let derivations = Arc::new(kyroql::InMemoryDerivationStore::default());
+
+    let engine = KyroEngine::new(
+        entities.clone(),
+        beliefs.clone(),
+        patterns.clone(),
+        conflicts.clone(),
+        derivations.clone(),
+    );
+
+    let entity = Entity::new("derive_sim_target", EntityType::Artifact);
+    let entity_id = entity.id;
+    entities.insert(entity).unwrap();
+
+    let assert_ir = AssertBuilder::new()
+        .entity(entity_id)
+        .predicate("premise")
+        .value(Value::Bool(true))
+        .confidence(Confidence::from_agent(0.9, "test").unwrap())
+        .source(Source::Unknown { description: None })
+        .valid_time(TimeRange::from_now())
+        .build()
+        .unwrap();
+
+    let EngineResponse::Assert { belief_id: premise_id, .. } = engine.execute(assert_ir).unwrap()
+    else {
+        panic!("expected EngineResponse::Assert");
+    };
+
+    let simulate_ir = SimulateBuilder::new()
+        .constraints(SimulateConstraints {
+            max_affected_entities: 10,
+            max_depth: 2,
+            max_duration_ms: 500,
+        })
+        .build()
+        .unwrap();
+
+    let EngineResponse::Simulate { simulation } = engine.execute(simulate_ir).unwrap() else {
+        panic!("expected EngineResponse::Simulate");
+    };
+
+    let derived = Belief::builder()
+        .subject(entity_id)
+        .predicate("derived")
+        .value(Value::Int(42))
+        .confidence(Confidence::from_agent(0.7, "sim").unwrap())
+        .source(Source::Unknown { description: None })
+        .valid_time(TimeRange::from_now())
+        .build()
+        .unwrap();
+    let derived_id = derived.id;
+
+    simulation.assert_hypothetical(derived).unwrap();
+
+    let derive_ir = DeriveBuilder::new()
+        .rule("test_rule")
+        .derived_belief(derived_id)
+        .add_source(premise_id)
+        .add_step("step 1")
+        .confidence(0.7)
+        .justification("because")
+        .build()
+        .unwrap();
+
+    let derivation_id = simulation.derive_ir(derive_ir).unwrap();
+    let rec = simulation.get_derivation(derivation_id).unwrap().unwrap();
+    assert_eq!(rec.rule, "test_rule");
+    assert_eq!(rec.premise_ids, vec![premise_id]);
+    assert_eq!(rec.derived_belief_id, Some(derived_id));
+
+    // Base derivation store must not be mutated by simulation-only DERIVE.
+    assert!(derivations.find_by_premise(premise_id).unwrap().is_empty());
 }

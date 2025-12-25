@@ -19,11 +19,12 @@ fn monitor_confidence_shift_streams_event() {
     let beliefs = Arc::new(stores.beliefs);
     let patterns = Arc::new(stores.patterns);
     let conflicts = Arc::new(stores.conflicts);
+    let derivations = Arc::new(stores.derivations);
 
     let entity = Entity::new("e", EntityType::Concept);
     entities.insert(entity.clone()).unwrap();
 
-    let engine = kyroql::KyroEngine::new(entities, beliefs, patterns, conflicts);
+    let engine = kyroql::KyroEngine::new(entities, beliefs, patterns, conflicts, derivations);
 
     let t0 = Utc::now();
     let assert1 = KyroIR {
@@ -106,6 +107,7 @@ fn monitor_pattern_violation_streams_event() {
     let beliefs = Arc::new(stores.beliefs);
     let patterns = Arc::new(stores.patterns);
     let conflicts = Arc::new(stores.conflicts);
+    let derivations = Arc::new(stores.derivations);
 
     let entity = Entity::new("e", EntityType::Concept);
     entities.insert(entity.clone()).unwrap();
@@ -122,7 +124,7 @@ fn monitor_pattern_violation_streams_event() {
     let pattern_id = pattern.id;
     patterns.insert(pattern).unwrap();
 
-    let engine = kyroql::KyroEngine::new(entities, beliefs, patterns, conflicts);
+    let engine = kyroql::KyroEngine::new(entities, beliefs, patterns, conflicts, derivations);
 
     let t0 = Utc::now();
     let monitor = KyroIR {
@@ -186,11 +188,12 @@ fn monitor_expiry_disconnects_stream() {
     let beliefs = Arc::new(stores.beliefs);
     let patterns = Arc::new(stores.patterns);
     let conflicts = Arc::new(stores.conflicts);
+    let derivations = Arc::new(stores.derivations);
 
     let entity = Entity::new("e", EntityType::Concept);
     entities.insert(entity.clone()).unwrap();
 
-    let engine = kyroql::KyroEngine::new(entities, beliefs, patterns, conflicts);
+    let engine = kyroql::KyroEngine::new(entities, beliefs, patterns, conflicts, derivations);
 
     let t0 = Utc::now();
     let monitor = KyroIR {
@@ -230,11 +233,12 @@ fn monitor_drop_stream_unregisters_subscription() {
     let beliefs = Arc::new(stores.beliefs);
     let patterns = Arc::new(stores.patterns);
     let conflicts = Arc::new(stores.conflicts);
+    let derivations = Arc::new(stores.derivations);
 
     let entity = Entity::new("e", EntityType::Concept);
     entities.insert(entity.clone()).unwrap();
 
-    let engine = kyroql::KyroEngine::new(entities, beliefs, patterns, conflicts);
+    let engine = kyroql::KyroEngine::new(entities, beliefs, patterns, conflicts, derivations);
 
     let t0 = Utc::now();
     let monitor = KyroIR {

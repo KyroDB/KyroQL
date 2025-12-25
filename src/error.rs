@@ -7,8 +7,9 @@
 use thiserror::Error;
 use chrono::{DateTime, Utc};
 
-use crate::entity::EntityId;
 use crate::confidence::BeliefId;
+use crate::conflict::ConflictId;
+use crate::entity::EntityId;
 
 /// Validation errors that occur during input validation.
 #[derive(Debug, Error)]
@@ -82,6 +83,15 @@ pub enum ValidationError {
         /// Reason for invalidity.
         reason: String,
     },
+
+    /// Field is syntactically valid but semantically invalid.
+    #[error("Invalid field '{field}': {reason}")]
+    InvalidField {
+        /// Field name.
+        field: String,
+        /// Reason the field is invalid.
+        reason: String,
+    },
 }
 
 /// Execution errors that occur during operation execution.
@@ -117,6 +127,13 @@ pub enum ExecutionError {
         max_value: u64,
         /// Actual value.
         actual_value: u64,
+    },
+
+    /// Commit of a simulation overlay is not allowed.
+    #[error("Simulation commit not allowed: {reason}")]
+    SimulationCommitNotAllowed {
+        /// Reason commit was rejected.
+        reason: String,
     },
 
     /// Operation timed out.
@@ -193,6 +210,30 @@ pub enum ExecutionError {
         pattern_name: String,
         /// Violation reason.
         reason: String,
+    },
+
+    /// Derivation request is invalid.
+    #[error("Invalid derivation: {reason}")]
+    InvalidDerivation {
+        /// Reason the derivation was rejected.
+        reason: String,
+    },
+
+    /// Simulation commit partially succeeded before failing.
+    #[error(
+        "Simulation commit partially applied; committed {committed_len} beliefs before failure at {failed_belief_id}: {cause}"
+    )]
+    SimulationPartialCommit {
+        /// Count of committed beliefs.
+        committed_len: usize,
+        /// Mapping of overlay belief IDs to newly committed base IDs.
+        committed: Vec<(BeliefId, BeliefId)>,
+        /// Conflicts recorded before failure.
+        conflict_ids: Vec<ConflictId>,
+        /// Overlay belief ID that failed.
+        failed_belief_id: BeliefId,
+        /// Underlying error.
+        cause: Box<KyroError>,
     },
 }
 
