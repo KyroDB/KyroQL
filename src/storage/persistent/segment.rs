@@ -8,7 +8,7 @@
 //! - Each segment contains a header, index, and data section
 //! - Compaction merges WAL entries into new segments
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write, Result as IoResult};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,10 @@ use crate::entity::{Entity, EntityId};
 use crate::pattern::{Pattern, PatternId};
 
 use super::codec;
+
+fn normalize_key(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
 
 /// A single segment file.
 #[derive(Debug)]
@@ -110,11 +114,22 @@ pub struct SegmentHeader {
 /// All data stored in a segment.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SegmentData {
-    pub entities: HashMap<EntityId, Entity>,
+    pub entities: EntityIndex,
     pub beliefs: HashMap<BeliefId, Belief>,
     pub patterns: HashMap<PatternId, Pattern>,
     pub conflicts: HashMap<ConflictId, Conflict>,
     pub derivations: HashMap<DerivationId, DerivationRecord>,
+}
+
+/// Entity index snapshot persisted inside a segment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EntityIndex {
+    pub by_id: HashMap<EntityId, Entity>,
+    pub by_name: HashMap<String, HashSet<EntityId>>,
+    pub versions: HashMap<EntityId, BTreeMap<u64, Entity>>,
+    pub merged_into: HashMap<EntityId, EntityId>,
+    pub merged_from: HashMap<EntityId, HashSet<EntityId>>,
+    pub embedding_dim: Option<usize>,
 }
 
 impl SegmentData {
@@ -125,7 +140,7 @@ impl SegmentData {
     
     /// Get total entry count.
     pub fn entry_count(&self) -> u64 {
-        (self.entities.len() 
+        (self.entities.by_id.len() 
             + self.beliefs.len() 
             + self.patterns.len() 
             + self.conflicts.len() 
@@ -347,11 +362,58 @@ impl SegmentManager {
             let data = segment.read_all()?;
             
             // Merge data (later segments override earlier ones)
-            combined.entities.extend(data.entities);
+            combined.entities.by_id.extend(data.entities.by_id);
+            for (id, versions) in data.entities.versions {
+                let entry = combined.entities.versions.entry(id).or_default();
+                for (ver, entity) in versions {
+                    entry.insert(ver, entity);
+                }
+            }
+
+            combined.entities.merged_into.extend(data.entities.merged_into);
+
+            for (id, merged) in data.entities.merged_from {
+                combined
+                    .entities
+                    .merged_from
+                    .entry(id)
+                    .or_default()
+                    .extend(merged);
+            }
+
+            if let Some(dim) = data.entities.embedding_dim {
+                combined.entities.embedding_dim = Some(dim);
+            }
             combined.beliefs.extend(data.beliefs);
             combined.patterns.extend(data.patterns);
             combined.conflicts.extend(data.conflicts);
             combined.derivations.extend(data.derivations);
+        }
+
+        // Rebuild name index from final entity state to avoid stale aliases.
+        combined.entities.by_name.clear();
+        for (id, entity) in &combined.entities.by_id {
+            let canon = normalize_key(&entity.canonical_name);
+            if !canon.is_empty() {
+                combined
+                    .entities
+                    .by_name
+                    .entry(canon)
+                    .or_default()
+                    .insert(*id);
+            }
+
+            for alias in &entity.aliases {
+                let key = normalize_key(alias);
+                if !key.is_empty() {
+                    combined
+                        .entities
+                        .by_name
+                        .entry(key)
+                        .or_default()
+                        .insert(*id);
+                }
+            }
         }
         
         Ok(combined)
@@ -394,7 +456,7 @@ mod tests {
         // Create test data
         let mut data = SegmentData::new();
         let entity = Entity::new("test", EntityType::Concept);
-        data.entities.insert(entity.id, entity.clone());
+        data.entities.by_id.insert(entity.id, entity.clone());
         
         // Write segment
         let mut writer = manager.create_segment_writer(1).unwrap();
@@ -405,8 +467,8 @@ mod tests {
         
         // Read back
         let read_data = segment.read_all().unwrap();
-        assert_eq!(read_data.entities.len(), 1);
-        assert!(read_data.entities.contains_key(&entity.id));
+        assert_eq!(read_data.entities.by_id.len(), 1);
+        assert!(read_data.entities.by_id.contains_key(&entity.id));
     }
     
     #[test]

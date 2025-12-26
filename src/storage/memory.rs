@@ -630,6 +630,23 @@ impl BeliefStore for InMemoryBeliefStore {
         Ok(())
     }
 
+    fn find_by_entity(&self, entity_id: EntityId) -> Result<Vec<Belief>, StorageError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| lock_err("belief.find_by_entity"))?;
+        let Some(ids) = state.by_entity.get(&entity_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut beliefs: Vec<Belief> = ids
+            .iter()
+            .filter_map(|id| state.by_id.get(id).cloned())
+            .collect();
+        beliefs.sort_by(|a, b| b.tx_time.cmp(&a.tx_time));
+        Ok(beliefs)
+    }
+
     fn find_by_entity_predicate(
         &self,
         entity_id: EntityId,

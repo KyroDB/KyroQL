@@ -21,7 +21,7 @@ use crate::derivation::{DerivationId, DerivationRecord};
 use crate::entity::{EntityId};
 use crate::error::{ExecutionError, KyroError, KyroResult, ValidationError};
 use crate::frame::{BeliefFrame, Evidence, KnowledgeGap, RankedClaim};
-use crate::inference::{apply_conflict_policy, ConflictResolutionPolicy, PolicyDecision};
+use crate::inference::{ConflictResolutionPolicy, PolicyDecision};
 use crate::ir::{
     ConsistencyMode, DefinePatternPayload, DerivePayload, KyroIR, MonitorPayload, Operation,
     ResolvePayload, RetractPayload, SimulatePayload,
@@ -35,6 +35,8 @@ use crate::storage::{
 };
 use crate::time::TimeRange;
 use crate::value::Value;
+use crate::trust::{TrustModel, SimpleTrustModel};
+use crate::meta::MetaAnalyzer;
 
 const REGEX_CACHE_MAX: usize = 1024;
 
@@ -131,6 +133,7 @@ pub struct KyroEngine {
     conflicts: Arc<dyn ConflictStore>,
     derivations: Arc<dyn DerivationStore>,
     monitor: Arc<MonitorSystem>,
+    trust: Arc<dyn TrustModel>,
 }
 
 impl KyroEngine {
@@ -147,6 +150,7 @@ impl KyroEngine {
             MonitorSystemConfig::default(),
             Arc::clone(&beliefs),
         ));
+        let trust = Arc::new(SimpleTrustModel::new());
         Self {
             entities,
             beliefs,
@@ -154,6 +158,32 @@ impl KyroEngine {
             conflicts,
             derivations,
             monitor,
+            trust,
+        }
+    }
+
+    /// Create a new engine with an explicit trust model.
+    #[must_use]
+    pub fn with_trust_model(
+        entities: Arc<dyn EntityStore>,
+        beliefs: Arc<dyn BeliefStore>,
+        patterns: Arc<dyn PatternStore>,
+        conflicts: Arc<dyn ConflictStore>,
+        derivations: Arc<dyn DerivationStore>,
+        trust: Arc<dyn TrustModel>,
+    ) -> Self {
+        let monitor = Arc::new(MonitorSystem::new(
+            MonitorSystemConfig::default(),
+            Arc::clone(&beliefs),
+        ));
+        Self {
+            entities,
+            beliefs,
+            patterns,
+            conflicts,
+            derivations,
+            monitor,
+            trust,
         }
     }
     
@@ -185,6 +215,111 @@ impl KyroEngine {
     /// Get a reference to the monitor system.
     pub fn monitor_system(&self) -> &Arc<MonitorSystem> {
         &self.monitor
+    }
+
+    /// Access the configured trust model.
+    pub fn trust_model(&self) -> &Arc<dyn TrustModel> {
+        &self.trust
+    }
+
+    /// Construct a meta-knowledge analyzer.
+    pub fn meta_analyzer(&self) -> MetaAnalyzer {
+        MetaAnalyzer::new(Arc::clone(&self.entities), Arc::clone(&self.beliefs))
+    }
+
+    fn trust_weight(&self, source: &crate::source::Source, domain: Option<&str>) -> f32 {
+        self.trust.assess(source, domain).weight()
+    }
+
+    fn trusted_confidence(&self, belief: &Belief, domain: Option<&str>) -> f32 {
+        belief.confidence.value().clamp(0.0, 1.0) * self.trust_weight(&belief.source, domain)
+    }
+
+    fn decide_with_trust(
+        &self,
+        policy: &ConflictResolutionPolicy,
+        beliefs: &[Belief],
+        domain: Option<&str>,
+    ) -> PolicyDecision {
+        if beliefs.is_empty() {
+            return PolicyDecision::Unresolved;
+        }
+
+        match policy {
+            ConflictResolutionPolicy::ExplicitConflict => PolicyDecision::Unresolved,
+            ConflictResolutionPolicy::LatestWins => {
+                let mut best = &beliefs[0];
+                for b in &beliefs[1..] {
+                    if b.tx_time > best.tx_time {
+                        best = b;
+                    } else if b.tx_time == best.tx_time {
+                        let tc = self.trusted_confidence(b, domain);
+                        let bc = self.trusted_confidence(best, domain);
+                        if tc > bc || (tc == bc && b.id.to_string() < best.id.to_string()) {
+                            best = b;
+                        }
+                    }
+                }
+                PolicyDecision::Selected(best.id)
+            }
+            ConflictResolutionPolicy::HighestConfidence => {
+                let mut best = &beliefs[0];
+                let mut best_score = self.trusted_confidence(best, domain);
+                for b in &beliefs[1..] {
+                    let score = self.trusted_confidence(b, domain);
+                    if score > best_score {
+                        best = b;
+                        best_score = score;
+                    } else if score == best_score {
+                        if b.tx_time > best.tx_time
+                            || (b.tx_time == best.tx_time && b.id.to_string() < best.id.to_string())
+                        {
+                            best = b;
+                            best_score = score;
+                        }
+                    }
+                }
+                PolicyDecision::Selected(best.id)
+            }
+            ConflictResolutionPolicy::SourcePriority { priority } => {
+                let priority = priority.as_slice();
+                let rank = |b: &Belief| {
+                    let sid = b.source.source_id();
+                    priority
+                        .iter()
+                        .position(|p| *p == sid)
+                        .unwrap_or(usize::MAX)
+                };
+
+                let mut best = &beliefs[0];
+                let mut best_rank = rank(best);
+                let mut best_score = self.trusted_confidence(best, domain);
+
+                for b in &beliefs[1..] {
+                    let r = rank(b);
+                    let score = self.trusted_confidence(b, domain);
+                    if r < best_rank {
+                        best = b;
+                        best_rank = r;
+                        best_score = score;
+                    } else if r == best_rank {
+                        if score > best_score {
+                            best = b;
+                            best_score = score;
+                        } else if score == best_score {
+                            if b.tx_time > best.tx_time
+                                || (b.tx_time == best.tx_time && b.id.to_string() < best.id.to_string())
+                            {
+                                best = b;
+                                best_score = score;
+                            }
+                        }
+                    }
+                }
+
+                PolicyDecision::Selected(best.id)
+            }
+        }
     }
 
     /// Execute a KyroQL IR request.
@@ -543,6 +678,7 @@ impl KyroEngine {
             .conflict_policy
             .clone()
             .unwrap_or_else(ConflictResolutionPolicy::default);
+        let mut trust_domain = payload.trust_domain.as_deref();
 
         // Conservative entity resolution from query.
         // We only auto-resolve if:
@@ -574,7 +710,7 @@ impl KyroEngine {
         frame.query_assumptions.as_of_time = as_of;
         frame.query_assumptions.min_confidence = payload.min_confidence;
         frame.query_assumptions.conflict_policy = policy.clone();
-        frame.query_assumptions.trust_model = policy.name().to_string();
+        frame.query_assumptions.trust_model = self.trust.name().to_string();
 
         // Semantic path (top-k embedding retrieval) if a query embedding is present.
         if let Some(query_embedding) = payload.query_embedding.as_deref() {
@@ -597,6 +733,7 @@ impl KyroEngine {
                 .as_deref()
                 .map(str::trim)
                 .filter(|p| !p.is_empty());
+            let trust_scope = trust_domain.or(predicate_filter);
             if let Some(pred) = predicate_filter {
                 matches.retain(|(b, _)| b.predicate == pred);
             }
@@ -640,7 +777,11 @@ impl KyroEngine {
             // Sort by similarity (descending), then by confidence.
             matches.sort_by(|(a, sa), (b, sb)| {
                 sb.total_cmp(sa)
-                    .then_with(|| b.confidence.value().total_cmp(&a.confidence.value()))
+                    .then_with(|| {
+                        let ba = self.trusted_confidence(a, trust_scope);
+                        let bb = self.trusted_confidence(b, trust_scope);
+                        bb.total_cmp(&ba)
+                    })
                     .then_with(|| b.tx_time.cmp(&a.tx_time))
                     .then_with(|| b.id.to_string().cmp(&a.id.to_string()))
             });
@@ -650,7 +791,11 @@ impl KyroEngine {
             let best_score = matches.first().map(|(_, s)| *s).unwrap_or(0.0).clamp(0.0, 1.0);
 
             let mut beliefs: Vec<Belief> = matches.iter().map(|(b, _)| b.clone()).collect();
-            beliefs.sort_by(|a, b| b.confidence.value().total_cmp(&a.confidence.value()));
+            beliefs.sort_by(|a, b| {
+                let ca = self.trusted_confidence(a, trust_scope);
+                let cb = self.trusted_confidence(b, trust_scope);
+                cb.total_cmp(&ca)
+            });
 
             // Conflict resolution for semantic results is still per-predicate/per-entity.
             // If filters don't constrain to a single predicate, we conservatively do not pick.
@@ -666,11 +811,12 @@ impl KyroEngine {
 
                 // Still attach evidence with relevance weights.
                 for (b, score) in matches {
+                    let trusted_conf = self.trusted_confidence(&b, trust_scope);
                     frame.supporting_evidence.push(Evidence::new(
                         b.id,
                         b.predicate.clone(),
                         b.source.clone(),
-                        b.confidence.value(),
+                        trusted_conf,
                         score.clamp(0.0, 1.0),
                     ));
                 }
@@ -689,7 +835,7 @@ impl KyroEngine {
             let (winner_id, decision) = if distinct_values.len() <= 1 {
                 (beliefs[0].id, PolicyDecision::Selected(beliefs[0].id))
             } else {
-                let decision = apply_conflict_policy(&policy, &beliefs);
+                let decision = self.decide_with_trust(&policy, &beliefs, trust_scope);
                 match decision {
                     PolicyDecision::Selected(id) => (id, decision),
                     PolicyDecision::Unresolved => {
@@ -712,16 +858,21 @@ impl KyroEngine {
                 .find(|b| b.id == winner_id)
                 .unwrap_or(&beliefs[0]);
 
-            let claim = RankedClaim::new(winner.clone(), winner.confidence.value(), best_score);
+            let claim = RankedClaim::new(
+                winner.clone(),
+                self.trusted_confidence(winner, trust_scope),
+                best_score,
+            );
 
             // Attach evidence with relevance weights.
             for (b, score) in matches {
+                let trusted_conf = self.trusted_confidence(&b, trust_scope);
                 if b.value == winner.value {
                     frame.supporting_evidence.push(Evidence::new(
                         b.id,
                         b.predicate.clone(),
                         b.source.clone(),
-                        b.confidence.value(),
+                        trusted_conf,
                         score.clamp(0.0, 1.0),
                     ));
                 } else if payload.include_counter_evidence {
@@ -729,7 +880,7 @@ impl KyroEngine {
                         b.id,
                         b.predicate.clone(),
                         b.source.clone(),
-                        b.confidence.value(),
+                        trusted_conf,
                         score.clamp(0.0, 1.0),
                     ));
                 }
@@ -799,6 +950,10 @@ impl KyroEngine {
             return Ok(EngineResponse::Resolve { frame });
         };
 
+        if trust_domain.is_none() {
+            trust_domain = Some(predicate);
+        }
+
         let all = self
             .beliefs
             .find_as_of(entity_id, predicate, as_of)
@@ -813,7 +968,12 @@ impl KyroEngine {
             .filter(|b| b.confidence.value() >= min_conf)
             .collect();
 
-        beliefs.sort_by(|a, b| b.confidence.value().total_cmp(&a.confidence.value()));
+        let trust_scope = trust_domain;
+        beliefs.sort_by(|a, b| {
+            let ca = self.trusted_confidence(a, trust_scope);
+            let cb = self.trusted_confidence(b, trust_scope);
+            cb.total_cmp(&ca)
+        });
         beliefs.truncate(payload.limit);
 
         if beliefs.is_empty() {
@@ -858,7 +1018,7 @@ impl KyroEngine {
             // No conflict; treat the best-ranked belief as selected.
             (beliefs[0].id, PolicyDecision::Selected(beliefs[0].id))
         } else {
-            let decision = apply_conflict_policy(&policy, &beliefs);
+            let decision = self.decide_with_trust(&policy, &beliefs, trust_scope);
             match decision {
                 PolicyDecision::Selected(id) => (id, decision),
                 PolicyDecision::Unresolved => {
@@ -886,7 +1046,7 @@ impl KyroEngine {
             .find(|b| b.id == winner_id)
             .unwrap_or(&beliefs[0]);
 
-        let claim = RankedClaim::new(winner.clone(), winner.confidence.value(), 1.0);
+        let claim = RankedClaim::new(winner.clone(), self.trusted_confidence(winner, trust_scope), 1.0);
 
         for b in &beliefs {
             if b.value == winner.value {
@@ -894,7 +1054,7 @@ impl KyroEngine {
                     b.id,
                     b.predicate.clone(),
                     b.source.clone(),
-                    b.confidence.value(),
+                    self.trusted_confidence(b, trust_scope),
                     1.0,
                 ));
             } else if payload.include_counter_evidence {
@@ -902,7 +1062,7 @@ impl KyroEngine {
                     b.id,
                     b.predicate.clone(),
                     b.source.clone(),
-                    b.confidence.value(),
+                    self.trusted_confidence(b, trust_scope),
                     1.0,
                 ));
             }
@@ -1181,6 +1341,7 @@ mod tests {
     use crate::ir::AssertPayload;
     use crate::source::Source;
     use crate::storage::memory::InMemoryStores;
+    use crate::trust::{SimpleTrustModel, TrustModel};
 
     fn engine() -> (KyroEngine, EntityId) {
         let stores = InMemoryStores::new();
@@ -1232,6 +1393,30 @@ mod tests {
         entities.insert(entity).unwrap();
 
         (eng, id, beliefs, derivations)
+    }
+
+    fn engine_with_trust_model(trust: Arc<dyn TrustModel>) -> (KyroEngine, EntityId) {
+        let stores = InMemoryStores::new();
+        let entities = Arc::new(stores.entities);
+        let beliefs = Arc::new(stores.beliefs);
+        let patterns = Arc::new(stores.patterns);
+        let conflicts = Arc::new(stores.conflicts);
+        let derivations = Arc::new(stores.derivations);
+
+        let eng = KyroEngine::with_trust_model(
+            entities.clone(),
+            beliefs.clone(),
+            patterns.clone(),
+            conflicts.clone(),
+            derivations.clone(),
+            trust,
+        );
+
+        let entity = Entity::new("LK-99", EntityType::Concept);
+        let id = entity.id;
+        entities.insert(entity).unwrap();
+
+        (eng, id)
     }
 
     #[test]
@@ -1695,7 +1880,7 @@ mod tests {
         assert!(frame.best_supported_claim.is_none());
         assert!(frame.has_conflicts());
         assert!(frame.has_gaps());
-        assert_eq!(frame.query_assumptions.trust_model, "explicit_conflict");
+        assert_eq!(frame.query_assumptions.trust_model, "simple_trust");
     }
 
     #[test]
@@ -1754,6 +1939,115 @@ mod tests {
             frame.best_supported_claim.unwrap().belief.value,
             Value::String("new".to_string())
         );
-        assert_eq!(frame.query_assumptions.trust_model, "latest_wins");
+        assert_eq!(frame.query_assumptions.trust_model, "simple_trust");
+    }
+
+    #[test]
+    fn resolve_trust_domain_defaults_to_predicate_and_affects_ranking() {
+        let model = Arc::new(SimpleTrustModel::new());
+        let source_a = Source::agent("a", Option::<String>::None);
+        let source_b = Source::agent("b", Option::<String>::None);
+
+        // In the "status" domain, downweight A and leave B at 1.0.
+        model.set_domain("status", source_a.source_id(), 0.0);
+        model.set_domain("status", source_b.source_id(), 1.0);
+
+        let (eng, id) = engine_with_trust_model(model);
+
+        // Without trust weighting, A would win (0.9 > 0.2).
+        // With trust weighting in the default scope (predicate "status"), B should win.
+        eng.execute(KyroIR::new(Operation::Assert(AssertPayload {
+            entity_id: id,
+            predicate: "status".to_string(),
+            value: Value::String("off".to_string()),
+            confidence: Confidence::from_agent(0.9, "a").unwrap(),
+            source: source_a.clone(),
+            valid_time: TimeRange::forever(),
+            consistency_mode: ConsistencyMode::Eventual,
+            embedding: None,
+        })))
+        .unwrap();
+
+        eng.execute(KyroIR::new(Operation::Assert(AssertPayload {
+            entity_id: id,
+            predicate: "status".to_string(),
+            value: Value::String("on".to_string()),
+            confidence: Confidence::from_agent(0.2, "b").unwrap(),
+            source: source_b.clone(),
+            valid_time: TimeRange::forever(),
+            consistency_mode: ConsistencyMode::Eventual,
+            embedding: None,
+        })))
+        .unwrap();
+
+        let resolve = KyroIR::new(Operation::Resolve(ResolvePayload {
+            entity_id: Some(id),
+            predicate: Some("status".to_string()),
+            // trust_domain intentionally omitted: should default to predicate.
+            ..ResolvePayload::default()
+        }));
+
+        let EngineResponse::Resolve { frame } = eng.execute(resolve).unwrap() else {
+            panic!("expected resolve");
+        };
+
+        assert_eq!(
+            frame.best_supported_claim.unwrap().belief.value,
+            Value::String("on".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_trust_domain_override_changes_scope() {
+        let model = Arc::new(SimpleTrustModel::new());
+        let source_a = Source::agent("a", Option::<String>::None);
+        let source_b = Source::agent("b", Option::<String>::None);
+
+        // Domain overrides apply only when that domain is selected.
+        model.set_domain("status", source_a.source_id(), 0.0);
+        model.set_domain("status", source_b.source_id(), 1.0);
+
+        let (eng, id) = engine_with_trust_model(model);
+
+        eng.execute(KyroIR::new(Operation::Assert(AssertPayload {
+            entity_id: id,
+            predicate: "status".to_string(),
+            value: Value::String("off".to_string()),
+            confidence: Confidence::from_agent(0.9, "a").unwrap(),
+            source: source_a.clone(),
+            valid_time: TimeRange::forever(),
+            consistency_mode: ConsistencyMode::Eventual,
+            embedding: None,
+        })))
+        .unwrap();
+
+        eng.execute(KyroIR::new(Operation::Assert(AssertPayload {
+            entity_id: id,
+            predicate: "status".to_string(),
+            value: Value::String("on".to_string()),
+            confidence: Confidence::from_agent(0.2, "b").unwrap(),
+            source: source_b.clone(),
+            valid_time: TimeRange::forever(),
+            consistency_mode: ConsistencyMode::Eventual,
+            embedding: None,
+        })))
+        .unwrap();
+
+        // Force a different trust domain that has no overrides => both weights default to 1.0.
+        let resolve = KyroIR::new(Operation::Resolve(ResolvePayload {
+            entity_id: Some(id),
+            predicate: Some("status".to_string()),
+            trust_domain: Some("other".to_string()),
+            ..ResolvePayload::default()
+        }));
+
+        let EngineResponse::Resolve { frame } = eng.execute(resolve).unwrap() else {
+            panic!("expected resolve");
+        };
+
+        assert_eq!(
+            frame.best_supported_claim.unwrap().belief.value,
+            Value::String("off".to_string())
+        );
     }
 }

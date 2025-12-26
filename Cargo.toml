@@ -64,6 +64,9 @@ stats_alloc = "0.1"
 # Temporary directories for tests
 tempfile = "3.14"
 
+# Hex encoding for test vectors
+hex = "0.4"
+
 # Benchmarks
 criterion = "0.5"
 

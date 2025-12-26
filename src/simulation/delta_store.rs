@@ -187,6 +187,10 @@ impl BeliefStore for ReadOnlyBeliefStore {
         Err(ro_err("belief.supersede"))
     }
 
+    fn find_by_entity(&self, entity_id: EntityId) -> Result<Vec<Belief>, StorageError> {
+        self.base.find_by_entity(entity_id)
+    }
+
     fn find_by_entity_predicate(
         &self,
         entity_id: EntityId,
@@ -345,6 +349,30 @@ impl BeliefStore for DeltaBeliefStore {
             .map_err(|_| StorageError::BackendError("poisoned lock: delta_beliefs.supersede".to_string()))?;
         guard.superseded.insert(old_id, new_id);
         Ok(())
+    }
+
+    fn find_by_entity(&self, entity_id: EntityId) -> Result<Vec<Belief>, StorageError> {
+        let mut out = self.base.find_by_entity(entity_id)?;
+
+        let state = self
+            .state
+            .read()
+            .map_err(|_| StorageError::BackendError("poisoned lock: delta_beliefs.find_by_entity".to_string()))?;
+
+        for belief in state.inserted.values() {
+            if belief.subject == entity_id {
+                out.push(belief.clone());
+            }
+        }
+
+        for belief in &mut out {
+            if let Some(new_id) = state.superseded.get(&belief.id).copied() {
+                belief.superseded_by = Some(new_id);
+            }
+        }
+
+        out.sort_by(|a, b| b.tx_time.cmp(&a.tx_time));
+        Ok(out)
     }
 
     fn find_by_entity_predicate(&self, entity_id: EntityId, predicate: &str) -> Result<Vec<Belief>, StorageError> {

@@ -122,6 +122,9 @@ pub trait BeliefStore: Send + Sync {
     /// Mark a belief as superseded by another.
     fn supersede(&self, old_id: BeliefId, new_id: BeliefId) -> Result<(), StorageError>;
 
+    /// Find all beliefs for an entity (any predicate).
+    fn find_by_entity(&self, entity_id: EntityId) -> Result<Vec<Belief>, StorageError>;
+
     /// Find beliefs by entity and predicate.
     fn find_by_entity_predicate(
         &self,

@@ -31,7 +31,7 @@ fn test_partial_wal_entry_recovery() {
     
     // Corrupt the WAL by truncating mid-entry
     {
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&wal_path)

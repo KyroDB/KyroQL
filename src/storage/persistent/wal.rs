@@ -24,7 +24,7 @@ use serde::{Serialize, Deserialize};
 use crate::belief::Belief;
 use crate::conflict::Conflict;
 use crate::derivation::DerivationRecord;
-use crate::entity::Entity;
+use crate::entity::{Entity, EntityId};
 use crate::pattern::Pattern;
 use crate::confidence::BeliefId;
 
@@ -48,6 +48,14 @@ pub enum WalEntryKind {
     EntityInsert(Entity),
     EntityUpdate(Entity),
     EntityDelete { id: crate::entity::EntityId },
+    EntityMerge {
+        /// The merged primary entity (post-merge state).
+        merged: Entity,
+        /// Secondary entity that was merged into the primary.
+        secondary_id: EntityId,
+        /// Secondary's canonical name for index cleanup during replay.
+        secondary_canonical: String,
+    },
     
     // Belief operations
     BeliefInsert(Belief),

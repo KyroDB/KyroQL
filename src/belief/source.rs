@@ -37,9 +37,11 @@ fn push_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
 }
 
 fn push_vec_str(out: &mut Vec<u8>, values: &[String]) {
-    push_u32(out, u32::try_from(values.len()).unwrap_or(u32::MAX));
-    for v in values {
-        push_str(out, v);
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    push_u32(out, u32::try_from(sorted.len()).unwrap_or(u32::MAX));
+    for v in sorted {
+        push_str(out, &v);
     }
 }
 
@@ -151,6 +153,12 @@ pub enum Source {
 }
 
 impl Source {
+    /// Returns a canonical, deterministic encoding of this source.
+    ///
+    /// The encoding is stable across versions as long as:
+    /// - Field order and discriminants remain unchanged.
+    /// - Optional fields are encoded with explicit presence markers.
+    /// - Collections that are conceptually sets are encoded in sorted order.
     fn stable_id_encoding(&self) -> Vec<u8> {
         let mut encoding = Vec::with_capacity(256);
         push_str(&mut encoding, "kyroql:source:v1");
@@ -208,9 +216,11 @@ impl Source {
                 derivation_rule,
             } => {
                 push_str(&mut encoding, "derived");
-                push_u32(&mut encoding, u32::try_from(premise_ids.len()).unwrap_or(u32::MAX));
-                for id in premise_ids {
-                    push_str(&mut encoding, &id.to_string());
+                let mut ids: Vec<String> = premise_ids.iter().map(|id| id.to_string()).collect();
+                ids.sort_unstable();
+                push_u32(&mut encoding, u32::try_from(ids.len()).unwrap_or(u32::MAX));
+                for id in ids {
+                    push_str(&mut encoding, &id);
                 }
                 push_str(&mut encoding, derivation_rule);
             }
@@ -385,6 +395,12 @@ impl Source {
         let uuid = Uuid::new_v5(&SOURCE_ID_NAMESPACE, digest.as_bytes());
         SourceId::from_uuid(uuid)
     }
+
+    /// Returns a canonical byte encoding suitable for deterministic hashing.
+    #[must_use]
+    pub fn stable_encoding(&self) -> Vec<u8> {
+        self.stable_id_encoding()
+    }
 }
 
 impl Default for Source {
@@ -516,6 +532,25 @@ mod tests {
         assert!(!source.is_automated());
 
         if let Source::Human { user_id, .. } = &source {
+
+    #[test]
+    fn test_stable_encoding_and_uuid_vector() {
+        let src = Source::Agent {
+            agent_id: "agent-x".to_string(),
+            agent_type: Some("llm".to_string()),
+            model_version: Some("1.2.3".to_string()),
+        };
+
+        let encoding = src.stable_encoding();
+        let digest = blake3::hash(&encoding);
+        let uuid = Uuid::new_v5(&SOURCE_ID_NAMESPACE, digest.as_bytes());
+
+        let expected_hex = "dff6b8e0f3da5ee1f711d2bfa3b4d157f4d7230f2acc3eac9d8c58cf0c8e7297";
+        let expected_uuid = Uuid::parse_str("60a51c60-143d-57f4-88f2-1492fb2f554d").unwrap();
+
+        assert_eq!(hex::encode(digest.as_bytes()), expected_hex);
+        assert_eq!(uuid, expected_uuid);
+    }
             assert_eq!(user_id, "user-123");
         } else {
             panic!("Expected Human source");

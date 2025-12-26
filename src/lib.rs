@@ -44,6 +44,8 @@ pub mod pattern;
 pub mod inference; // Exposing the inference module
 
 pub mod engine;
+pub mod trust;
+pub mod meta;
 
 pub mod simulation;
 
@@ -93,6 +95,9 @@ pub use engine::runtime::{DefaultRouter, ExecutionHandle, ExecutionPath, KyroRun
 pub use inference::ConflictResolutionPolicy; // Exposing ConflictResolutionPolicy from inference module
 
 pub use simulation::{SimulateConstraints, SimulationContext, SimulationId, SimulationImpact};
+
+pub use trust::{TrustModel, SimpleTrustModel, TrustAssessment};
+pub use meta::{MetaAnalyzer, CoverageReport, PredicateCoverage, GapAnalysisResult, CalibrationSummary};
 
 pub use monitor::{EventPayload, MonitorEvent, MonitorEventError, MonitorRegistration, MonitorStream, MonitorSystem, MonitorSystemConfig, SubscriptionId, Trigger, TriggerId};
 

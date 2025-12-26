@@ -34,6 +34,7 @@ pub struct ResolveBuilder {
     include_counter_evidence: bool,
     include_gaps: bool,
     conflict_policy: Option<ConflictResolutionPolicy>,
+    trust_domain: Option<String>,
 }
 
 impl Default for ResolveBuilder {
@@ -50,6 +51,7 @@ impl Default for ResolveBuilder {
             include_counter_evidence: false,
             include_gaps: true,
             conflict_policy: None,
+            trust_domain: None,
         }
     }
 }
@@ -140,6 +142,13 @@ impl ResolveBuilder {
         self
     }
 
+    /// Scope trust weighting to a domain (predicate/topic).
+    #[must_use]
+    pub fn trust_domain(mut self, domain: impl Into<String>) -> Self {
+        self.trust_domain = Some(domain.into());
+        self
+    }
+
     /// Build the RESOLVE IR.
     ///
     /// Returns `ValidationError` if:
@@ -184,6 +193,7 @@ impl ResolveBuilder {
             include_counter_evidence: self.include_counter_evidence,
             include_gaps: self.include_gaps,
             conflict_policy: self.conflict_policy,
+            trust_domain: self.trust_domain,
         };
 
         Ok(KyroIR::new(Operation::Resolve(payload)))

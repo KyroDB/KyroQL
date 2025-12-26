@@ -161,6 +161,10 @@ pub struct ResolvePayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict_policy: Option<ConflictResolutionPolicy>,
 
+    /// Optional trust domain to scope source weighting (e.g., predicate or topic).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_domain: Option<String>,
+
     /// Optional vector embedding for the query (semantic RESOLVE path).
     ///
     /// If omitted and `query` is present, the engine may fall back to lexical matching.
@@ -261,6 +265,7 @@ impl PartialEq for ResolvePayload {
             && self.include_counter_evidence == other.include_counter_evidence
             && self.include_gaps == other.include_gaps
             && self.conflict_policy == other.conflict_policy
+            && self.trust_domain == other.trust_domain
             && opt_vec_f32_approx_eq(&self.query_embedding, &other.query_embedding)
     }
 }
@@ -286,6 +291,7 @@ impl Default for ResolvePayload {
             include_counter_evidence: false,
             include_gaps: true,
             conflict_policy: None,
+            trust_domain: None,
             query_embedding: None,
         }
     }
@@ -515,6 +521,7 @@ mod tests {
             include_counter_evidence: true,
             include_gaps: true,
             conflict_policy: None,
+            trust_domain: None,
         };
 
         let json = serde_json::to_string(&payload).unwrap();

@@ -29,6 +29,137 @@ use super::segment::SegmentManager;
 use super::wal::{WalEntryKind, WriteAheadLog};
 use super::PersistentConfig;
 
+fn lock_err(context: &'static str) -> StorageError {
+    StorageError::BackendError(format!("poisoned lock: {context}"))
+}
+
+fn normalize_key(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
+fn resolve_canonical_id(index: &EntityIndex, id: EntityId) -> Result<EntityId, StorageError> {
+    let mut current = id;
+    for _ in 0..128 {
+        if let Some(next) = index.merged_into.get(&current).copied() {
+            if next == current {
+                return Err(StorageError::BackendError(
+                    "entity merge map contains a self-cycle".to_string(),
+                ));
+            }
+            current = next;
+            continue;
+        }
+        return Ok(current);
+    }
+
+    Err(StorageError::BackendError(
+        "entity merge map resolution exceeded hop limit".to_string(),
+    ))
+}
+
+fn record_entity_version(
+    index: &mut EntityIndex,
+    entity: &Entity,
+    context: &'static str,
+) -> Result<(), StorageError> {
+    let versions = index.versions.entry(entity.id).or_default();
+    if versions.contains_key(&entity.version) {
+        return Err(StorageError::BackendError(format!(
+            "duplicate entity version ({context}): id={} version={}",
+            entity.id, entity.version
+        )));
+    }
+    versions.insert(entity.version, entity.clone());
+    Ok(())
+}
+
+fn merge_metadata(primary: &serde_json::Value, secondary: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    match (primary, secondary) {
+        (Value::Null, other) => other.clone(),
+        (Value::Object(a), Value::Object(b)) => {
+            let mut out = a.clone();
+            for (k, v) in b {
+                out.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            Value::Object(out)
+        }
+        (a, _) => a.clone(),
+    }
+}
+
+fn merge_embeddings(a: &[f32], b: &[f32]) -> Result<Vec<f32>, StorageError> {
+    if a.len() != b.len() {
+        return Err(StorageError::BackendError(format!(
+            "cannot merge embeddings with different dimensions: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    if a.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(a.len());
+    let mut norm2 = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let v = (f64::from(x) + f64::from(y)) * 0.5;
+        norm2 += v * v;
+        #[allow(clippy::cast_possible_truncation)]
+        out.push(v as f32);
+    }
+
+    if norm2 <= 0.0 {
+        return Ok(out);
+    }
+    let inv = 1.0 / norm2.sqrt();
+    for v in &mut out {
+        *v = (*v as f64 * inv) as f32;
+    }
+    Ok(out)
+}
+
+fn validate_embedding_dim(
+    expected: Option<usize>,
+    embedding: &[f32],
+    context: &'static str,
+) -> Result<(), StorageError> {
+    if embedding.is_empty() {
+        return Err(StorageError::BackendError(format!(
+            "embedding dimension must be non-zero ({context})"
+        )));
+    }
+
+    if let Some(exp) = expected {
+        if exp != embedding.len() {
+            return Err(StorageError::BackendError(format!(
+                "embedding dimension mismatch ({context}): expected={exp} actual={}",
+                embedding.len()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_embedding_dim(
+    expected: &mut Option<usize>,
+    embedding: Option<&Vec<f32>>,
+    context: &'static str,
+) -> Result<(), StorageError> {
+    let Some(emb) = embedding else {
+        return Ok(());
+    };
+    validate_embedding_dim(*expected, emb, context)?;
+    if expected.is_none() {
+        *expected = Some(emb.len());
+    }
+    Ok(())
+}
+
+type EntityIndex = super::segment::EntityIndex;
+
 /// Aggregate type containing all persistent stores.
 ///
 /// This is the primary entry point for persistent storage.
@@ -133,7 +264,7 @@ impl PersistentStores {
         
         // Populate in-memory indexes
         *self.entities.index.write().unwrap() = data.entities;
-        *self.beliefs.index.write().unwrap() = data.beliefs;
+        *self.beliefs.index.write().unwrap() = BeliefIndex::from_map(data.beliefs);
         *self.patterns.index.write().unwrap() = data.patterns;
         *self.conflicts.index.write().unwrap() = data.conflicts;
         *self.derivations.index.write().unwrap() = data.derivations;
@@ -158,20 +289,36 @@ impl PersistentStores {
             })?;
             
             match entry.kind {
-                WalEntryKind::EntityInsert(entity) => {
-                    self.entities.index.write().unwrap().insert(entity.id, entity);
-                }
-                WalEntryKind::EntityUpdate(entity) => {
-                    self.entities.index.write().unwrap().insert(entity.id, entity);
-                }
-                WalEntryKind::EntityDelete { id } => {
-                    self.entities.index.write().unwrap().remove(&id);
+                WalEntryKind::EntityInsert(_)
+                | WalEntryKind::EntityUpdate(_)
+                | WalEntryKind::EntityDelete { .. }
+                | WalEntryKind::EntityMerge { .. } => {
+                    self.entities.apply_wal(&entry.kind).map_err(|e| {
+                        KyroError::Execution(ExecutionError::Storage {
+                            message: format!("failed to apply WAL entity entry: {e}"),
+                        })
+                    })?;
                 }
                 WalEntryKind::BeliefInsert(belief) => {
-                    self.beliefs.index.write().unwrap().insert(belief.id, belief);
+                    self.beliefs
+                        .index
+                        .write()
+                        .map_err(|_| KyroError::Execution(ExecutionError::Storage {
+                            message: "poisoned lock: belief.wal".to_string(),
+                        }))?
+                        .insert(belief);
                 }
                 WalEntryKind::BeliefSupersede { old_id, new_id } => {
-                    if let Some(belief) = self.beliefs.index.write().unwrap().get_mut(&old_id) {
+                    if let Some(belief) = self
+                        .beliefs
+                        .index
+                        .write()
+                        .map_err(|_| KyroError::Execution(ExecutionError::Storage {
+                            message: "poisoned lock: belief.wal".to_string(),
+                        }))?
+                        .by_id
+                        .get_mut(&old_id)
+                    {
                         belief.superseded_by = Some(new_id);
                     }
                 }
@@ -239,7 +386,7 @@ impl PersistentStores {
         // of truth and will reconcile any missing entries on reopen.
         let data = SegmentData {
             entities: self.entities.index.read().unwrap().clone(),
-            beliefs: self.beliefs.index.read().unwrap().clone(),
+            beliefs: self.beliefs.index.read().unwrap().by_id.clone(),
             patterns: self.patterns.index.read().unwrap().clone(),
             conflicts: self.conflicts.index.read().unwrap().clone(),
             derivations: self.derivations.index.read().unwrap().clone(),
@@ -326,223 +473,741 @@ pub struct CompactionResult {
 
 pub struct PersistentEntityStore {
     wal: Arc<WriteAheadLog>,
-    index: RwLock<HashMap<EntityId, Entity>>,
+    index: RwLock<EntityIndex>,
 }
 
 impl PersistentEntityStore {
     fn new(wal: Arc<WriteAheadLog>) -> Self {
         Self {
             wal,
-            index: RwLock::new(HashMap::new()),
+            index: RwLock::new(EntityIndex::default()),
+        }
+    }
+
+    fn insert_internal(&self, entity: Entity, emit_wal: bool) -> Result<(), StorageError> {
+        let mut index = self.index.write().map_err(|_| lock_err("entity.insert"))?;
+
+        if index.by_id.contains_key(&entity.id) || index.merged_into.contains_key(&entity.id) {
+            return Err(StorageError::DuplicateKey(entity.id.to_string()));
+        }
+
+        if let Some(emb) = entity.embedding.as_ref() {
+            validate_embedding_dim(index.embedding_dim, emb, "entity.insert")?;
+        }
+
+        if index
+            .versions
+            .get(&entity.id)
+            .map_or(false, |m| m.contains_key(&entity.version))
+        {
+            return Err(StorageError::BackendError(format!(
+                "entity version already exists (entity.insert): id={} version={}",
+                entity.id, entity.version
+            )));
+        }
+
+        if emit_wal {
+            self
+                .wal
+                .append(WalEntryKind::EntityInsert(entity.clone()))
+                .map_err(|e| StorageError::BackendError(format!("WAL write failed: {e}")))?;
+        }
+
+        apply_embedding_dim(&mut index.embedding_dim, entity.embedding.as_ref(), "entity.insert")?;
+        record_entity_version(&mut index, &entity, "entity.insert")?;
+
+        let name_key = normalize_key(&entity.canonical_name);
+        index.by_name.entry(name_key).or_default().insert(entity.id);
+        index.by_id.insert(entity.id, entity);
+        Ok(())
+    }
+
+    fn update_internal(&self, entity: Entity, emit_wal: bool) -> Result<(), StorageError> {
+        let mut index = self.index.write().map_err(|_| lock_err("entity.update"))?;
+
+        let canonical = resolve_canonical_id(&index, entity.id)?;
+        if canonical != entity.id {
+            return Err(StorageError::BackendError(
+                "cannot update an entity that has been merged".to_string(),
+            ));
+        }
+
+        let prev = index
+            .by_id
+            .get(&entity.id)
+            .cloned()
+            .ok_or(StorageError::EntityNotFound(entity.id))?;
+
+        if entity.version <= prev.version {
+            return Err(StorageError::BackendError(format!(
+                "entity version must increase on update: id={} prev={} new={}",
+                entity.id, prev.version, entity.version
+            )));
+        }
+
+        if let Some(emb) = entity.embedding.as_ref() {
+            validate_embedding_dim(index.embedding_dim, emb, "entity.update")?;
+        }
+
+        if index
+            .versions
+            .get(&entity.id)
+            .map_or(false, |m| m.contains_key(&entity.version))
+        {
+            return Err(StorageError::BackendError(format!(
+                "entity version already exists (entity.update): id={} version={}",
+                entity.id, entity.version
+            )));
+        }
+
+        if emit_wal {
+            self
+                .wal
+                .append(WalEntryKind::EntityUpdate(entity.clone()))
+                .map_err(|e| StorageError::BackendError(format!("WAL write failed: {e}")))?;
+        }
+
+        apply_embedding_dim(&mut index.embedding_dim, entity.embedding.as_ref(), "entity.update")?;
+
+        let prev_key = normalize_key(&prev.canonical_name);
+        let new_key = normalize_key(&entity.canonical_name);
+        if prev_key != new_key {
+            if let Some(set) = index.by_name.get_mut(&prev_key) {
+                set.remove(&entity.id);
+                if set.is_empty() {
+                    index.by_name.remove(&prev_key);
+                }
+            }
+            index.by_name.entry(new_key).or_default().insert(entity.id);
+        }
+
+        record_entity_version(&mut index, &entity, "entity.update")?;
+        index.by_id.insert(entity.id, entity);
+        Ok(())
+    }
+
+    fn delete_internal(&self, id: EntityId, emit_wal: bool) -> Result<(), StorageError> {
+        let mut index = self.index.write().map_err(|_| lock_err("entity.delete"))?;
+
+        let canonical = resolve_canonical_id(&index, id)?;
+        if canonical != id {
+            return Err(StorageError::BackendError(
+                "cannot delete an entity that has been merged".to_string(),
+            ));
+        }
+
+        if index
+            .merged_from
+            .get(&id)
+            .map_or(false, |s| !s.is_empty())
+        {
+            return Err(StorageError::BackendError(
+                "cannot delete an entity that has other entities merged into it".to_string(),
+            ));
+        }
+
+        if emit_wal {
+            self
+                .wal
+                .append(WalEntryKind::EntityDelete { id })
+                .map_err(|e| StorageError::BackendError(format!("WAL write failed: {e}")))?;
+        }
+
+        let prev = index
+            .by_id
+            .remove(&id)
+            .ok_or(StorageError::EntityNotFound(id))?;
+
+        let prev_key = normalize_key(&prev.canonical_name);
+        if let Some(set) = index.by_name.get_mut(&prev_key) {
+            set.remove(&id);
+            if set.is_empty() {
+                index.by_name.remove(&prev_key);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn merge_internal(
+        &self,
+        merged: Entity,
+        secondary_id: EntityId,
+        secondary_canonical: String,
+        emit_wal: bool,
+    ) -> Result<Entity, StorageError> {
+        let mut index = self.index.write().map_err(|_| lock_err("entity.merge"))?;
+
+        let primary_canonical = resolve_canonical_id(&index, merged.id)?;
+        let secondary_canonical_id = resolve_canonical_id(&index, secondary_id)?;
+
+        if primary_canonical == secondary_canonical_id {
+            return Err(StorageError::BackendError(
+                "cannot merge: both IDs resolve to the same canonical entity".to_string(),
+            ));
+        }
+
+        let prev_primary = index
+            .by_id
+            .get(&primary_canonical)
+            .cloned()
+            .ok_or(StorageError::EntityNotFound(primary_canonical))?;
+
+        if !index.by_id.contains_key(&secondary_canonical_id) {
+            return Err(StorageError::EntityNotFound(secondary_canonical_id));
+        }
+
+        if merged.version <= prev_primary.version {
+            return Err(StorageError::BackendError(format!(
+                "entity version must increase on merge: id={} prev={} new={}",
+                merged.id, prev_primary.version, merged.version
+            )));
+        }
+
+        if let Some(emb) = merged.embedding.as_ref() {
+            validate_embedding_dim(index.embedding_dim, emb, "entity.merge")?;
+        }
+
+        if index
+            .versions
+            .get(&merged.id)
+            .map_or(false, |m| m.contains_key(&merged.version))
+        {
+            return Err(StorageError::BackendError(format!(
+                "entity version already exists (entity.merge): id={} version={}",
+                merged.id, merged.version
+            )));
+        }
+
+        if emit_wal {
+            self
+                .wal
+                .append(WalEntryKind::EntityMerge {
+                    merged: merged.clone(),
+                    secondary_id: secondary_canonical_id,
+                    secondary_canonical: secondary_canonical.clone(),
+                })
+                .map_err(|e| StorageError::BackendError(format!("WAL write failed: {e}")))?;
+        }
+
+        apply_embedding_dim(&mut index.embedding_dim, merged.embedding.as_ref(), "entity.merge")?;
+
+        let prev_key = normalize_key(&prev_primary.canonical_name);
+        let new_key = normalize_key(&merged.canonical_name);
+        if prev_key != new_key {
+            if let Some(set) = index.by_name.get_mut(&prev_key) {
+                set.remove(&merged.id);
+                if set.is_empty() {
+                    index.by_name.remove(&prev_key);
+                }
+            }
+            index.by_name.entry(new_key).or_default().insert(merged.id);
+        }
+
+        record_entity_version(&mut index, &merged, "entity.merge")?;
+        index.by_id.insert(primary_canonical, merged.clone());
+
+        let secondary_key = normalize_key(&secondary_canonical);
+        if let Some(set) = index.by_name.get_mut(&secondary_key) {
+            set.remove(&secondary_canonical_id);
+            if set.is_empty() {
+                index.by_name.remove(&secondary_key);
+            }
+        }
+        index.by_id.remove(&secondary_canonical_id);
+
+        index
+            .merged_into
+            .insert(secondary_canonical_id, primary_canonical);
+        index
+            .merged_from
+            .entry(primary_canonical)
+            .or_default()
+            .insert(secondary_canonical_id);
+
+        Ok(merged)
+    }
+
+    fn apply_wal(&self, kind: &WalEntryKind) -> Result<(), StorageError> {
+        match kind {
+            WalEntryKind::EntityInsert(entity) => self.insert_internal(entity.clone(), false),
+            WalEntryKind::EntityUpdate(entity) => self.update_internal(entity.clone(), false),
+            WalEntryKind::EntityDelete { id } => self.delete_internal(*id, false),
+            WalEntryKind::EntityMerge {
+                merged,
+                secondary_id,
+                secondary_canonical,
+            } => self.merge_internal(merged.clone(), *secondary_id, secondary_canonical.clone(), false).map(|_| ()),
+            _ => Ok(()),
         }
     }
 }
 
 impl EntityStore for PersistentEntityStore {
     fn insert(&self, entity: Entity) -> Result<(), StorageError> {
-        let mut index = self.index.write().unwrap();
-        
-        if index.contains_key(&entity.id) {
-            return Err(StorageError::DuplicateKey(format!("entity:{}", entity.id)));
-        }
-        
-        self.wal.append(WalEntryKind::EntityInsert(entity.clone()))
-            .map_err(|e| StorageError::BackendError(format!("WAL write failed: {}", e)))?;
-        
-        index.insert(entity.id, entity);
-        Ok(())
+        self.insert_internal(entity, true)
     }
     
     fn get(&self, id: EntityId) -> Result<Option<Entity>, StorageError> {
-        Ok(self.index.read().unwrap().get(&id).cloned())
+        let index = self.index.read().map_err(|_| lock_err("entity.get"))?;
+        let canonical = resolve_canonical_id(&index, id)?;
+        Ok(index.by_id.get(&canonical).cloned())
     }
     
     fn update(&self, entity: Entity) -> Result<(), StorageError> {
-        let mut index = self.index.write().unwrap();
-        
-        if !index.contains_key(&entity.id) {
-            return Err(StorageError::EntityNotFound(entity.id));
-        }
-        
-        self.wal.append(WalEntryKind::EntityUpdate(entity.clone()))
-            .map_err(|e| StorageError::BackendError(format!("WAL write failed: {}", e)))?;
-        
-        index.insert(entity.id, entity);
-        Ok(())
+        self.update_internal(entity, true)
     }
     
     fn delete(&self, id: EntityId) -> Result<(), StorageError> {
-        let mut index = self.index.write().unwrap();
-        
-        if !index.contains_key(&id) {
-            return Err(StorageError::EntityNotFound(id));
-        }
-        
-        self.wal.append(WalEntryKind::EntityDelete { id })
-            .map_err(|e| StorageError::BackendError(format!("WAL write failed: {}", e)))?;
-        
-        index.remove(&id);
-        Ok(())
+        self.delete_internal(id, true)
     }
     
     fn find_by_name(&self, name: &str) -> Result<Vec<Entity>, StorageError> {
-        let index = self.index.read().unwrap();
-        Ok(index.values()
-            .filter(|e| e.canonical_name == name)
-            .cloned()
-            .collect())
+        let name_key = normalize_key(name);
+        let index = self.index.read().map_err(|_| lock_err("entity.find_by_name"))?;
+        let Some(ids) = index.by_name.get(&name_key) else {
+            return Ok(Vec::new());
+        };
+
+        let mut results: Vec<Entity> = ids
+            .iter()
+            .filter_map(|id| index.by_id.get(id).cloned())
+            .collect();
+        results.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+        Ok(results)
     }
     
     fn find_by_name_fuzzy(&self, query: &str, limit: usize) -> Result<Vec<Entity>, StorageError> {
-        let index = self.index.read().unwrap();
-        let query_lower = query.to_lowercase();
-        
-        let mut matches: Vec<_> = index.values()
-            .filter(|e| {
-                e.canonical_name.to_lowercase().contains(&query_lower)
-                    || e.aliases.iter().any(|a| a.to_lowercase().contains(&query_lower))
-            })
-            .cloned()
-            .collect();
-        
-        matches.truncate(limit);
-        Ok(matches)
+        let query_key = normalize_key(query);
+        if query_key.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("entity.find_by_name_fuzzy"))?;
+
+        let mut scored: Vec<(u8, Entity)> = Vec::new();
+        for entity in index.by_id.values() {
+            let canonical = normalize_key(&entity.canonical_name);
+            let mut score = 0u8;
+            if canonical.starts_with(&query_key) {
+                score = score.max(3);
+            } else if canonical.contains(&query_key) {
+                score = score.max(2);
+            }
+
+            for alias in &entity.aliases {
+                let alias_key = normalize_key(alias);
+                if alias_key.starts_with(&query_key) {
+                    score = score.max(2);
+                } else if alias_key.contains(&query_key) {
+                    score = score.max(1);
+                }
+            }
+
+            if score > 0 {
+                scored.push((score, entity.clone()));
+            }
+        }
+
+        scored.sort_by(|(sa, ea), (sb, eb)| {
+            sb.cmp(sa)
+                .then_with(|| ea.canonical_name.cmp(&eb.canonical_name))
+                .then_with(|| ea.id.to_string().cmp(&eb.id.to_string()))
+        });
+
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, e)| e)
+            .collect())
     }
     
     fn find_by_embedding(&self, embedding: &[f32], limit: usize) -> Result<Vec<(Entity, f32)>, StorageError> {
-        let index = self.index.read().unwrap();
-        
-        let mut scored: Vec<_> = index.values()
-            .filter_map(|e| {
-                e.embedding.as_ref().map(|emb| {
-                    let score = cosine_similarity(embedding, emb);
-                    (e.clone(), score)
-                })
-            })
-            .collect();
-        
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("entity.find_by_embedding"))?;
+
+        if let Some(exp) = index.embedding_dim {
+            if exp != embedding.len() {
+                return Err(StorageError::BackendError(format!(
+                    "embedding dimension mismatch (entity.find_by_embedding): expected={exp} actual={}",
+                    embedding.len()
+                )));
+            }
+        }
+
+        let mut scored: Vec<(Entity, f32)> = Vec::new();
+        for entity in index.by_id.values() {
+            let Some(stored) = entity.embedding.as_ref() else {
+                continue;
+            };
+            let score = cosine_similarity(embedding, stored)?;
+            if score > 0.0 {
+                scored.push((entity.clone(), score));
+            }
+        }
+
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored.truncate(limit);
         Ok(scored)
     }
     
-    fn merge(&self, _primary: EntityId, _secondary: EntityId) -> Result<Entity, StorageError> {
-        // TODO: Implement entity merging
-        Err(StorageError::BackendError("entity merge not yet implemented".to_string()))
+    fn merge(&self, primary: EntityId, secondary: EntityId) -> Result<Entity, StorageError> {
+        if primary == secondary {
+            return Err(StorageError::BackendError(
+                "cannot merge an entity into itself".to_string(),
+            ));
+        }
+
+        let mut index = self.index.write().map_err(|_| lock_err("entity.merge"))?;
+
+        let primary_canonical = resolve_canonical_id(&index, primary)?;
+        let secondary_canonical = resolve_canonical_id(&index, secondary)?;
+        if primary_canonical == secondary_canonical {
+            return Err(StorageError::BackendError(
+                "cannot merge: both IDs resolve to the same canonical entity".to_string(),
+            ));
+        }
+
+        let mut primary_entity = index
+            .by_id
+            .get(&primary_canonical)
+            .cloned()
+            .ok_or(StorageError::EntityNotFound(primary_canonical))?;
+        let secondary_entity = index
+            .by_id
+            .get(&secondary_canonical)
+            .cloned()
+            .ok_or(StorageError::EntityNotFound(secondary_canonical))?;
+
+        let secondary_names = std::iter::once(secondary_entity.canonical_name.clone())
+            .chain(secondary_entity.aliases.clone());
+        for name in secondary_names {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if name.eq_ignore_ascii_case(&primary_entity.canonical_name) {
+                continue;
+            }
+            if primary_entity
+                .aliases
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            primary_entity.aliases.push(name.to_string());
+        }
+
+        primary_entity.metadata =
+            merge_metadata(&primary_entity.metadata, &secondary_entity.metadata);
+
+        primary_entity.embedding = match (
+            primary_entity.embedding.as_ref(),
+            secondary_entity.embedding.as_ref(),
+        ) {
+            (Some(a), Some(b)) => Some(merge_embeddings(a, b)?),
+            (Some(a), None) => Some(a.clone()),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        };
+
+        let now = Utc::now();
+        primary_entity.updated_at = now;
+        primary_entity.version = primary_entity
+            .version
+            .checked_add(1)
+            .ok_or_else(|| StorageError::BackendError("entity version overflow".to_string()))?;
+
+        if let Some(emb) = primary_entity.embedding.as_ref() {
+            validate_embedding_dim(index.embedding_dim, emb, "entity.merge")?;
+        }
+
+        if index
+            .versions
+            .get(&primary_entity.id)
+            .map_or(false, |m| m.contains_key(&primary_entity.version))
+        {
+            return Err(StorageError::BackendError(format!(
+                "entity version already exists (entity.merge): id={} version={}",
+                primary_entity.id, primary_entity.version
+            )));
+        }
+
+        self
+            .wal
+            .append(WalEntryKind::EntityMerge {
+                merged: primary_entity.clone(),
+                secondary_id: secondary_canonical,
+                secondary_canonical: secondary_entity.canonical_name.clone(),
+            })
+            .map_err(|e| StorageError::BackendError(format!("WAL write failed: {e}")))?;
+
+        apply_embedding_dim(&mut index.embedding_dim, primary_entity.embedding.as_ref(), "entity.merge")?;
+
+        let prev_key = normalize_key(&primary_entity.canonical_name);
+        index
+            .by_name
+            .entry(prev_key)
+            .or_default()
+            .insert(primary_canonical);
+
+        record_entity_version(&mut index, &primary_entity, "entity.merge")?;
+        index.by_id.insert(primary_canonical, primary_entity.clone());
+
+        let secondary_key = normalize_key(&secondary_entity.canonical_name);
+        if let Some(set) = index.by_name.get_mut(&secondary_key) {
+            set.remove(&secondary_canonical);
+            if set.is_empty() {
+                index.by_name.remove(&secondary_key);
+            }
+        }
+        index.by_id.remove(&secondary_canonical);
+
+        index
+            .merged_into
+            .insert(secondary_canonical, primary_canonical);
+        index
+            .merged_from
+            .entry(primary_canonical)
+            .or_default()
+            .insert(secondary_canonical);
+
+        Ok(primary_entity)
     }
     
-    fn get_at_version(&self, _id: EntityId, _version: u64) -> Result<Option<Entity>, StorageError> {
-        // TODO: Implement versioning
-        Err(StorageError::BackendError("versioning not yet implemented".to_string()))
+    fn get_at_version(&self, id: EntityId, version: u64) -> Result<Option<Entity>, StorageError> {
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("entity.get_at_version"))?;
+        Ok(index
+            .versions
+            .get(&id)
+            .and_then(|m| m.get(&version))
+            .cloned())
     }
     
-    fn list_versions(&self, _id: EntityId) -> Result<Vec<Entity>, StorageError> {
-        // TODO: Implement versioning
-        Err(StorageError::BackendError("versioning not yet implemented".to_string()))
+    fn list_versions(&self, id: EntityId) -> Result<Vec<Entity>, StorageError> {
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("entity.list_versions"))?;
+        let Some(map) = index.versions.get(&id) else {
+            return Ok(Vec::new());
+        };
+        Ok(map.values().cloned().collect())
     }
 }
 
 // --- Belief Store ---
 
+#[derive(Debug, Default, Clone)]
+struct BeliefIndex {
+    by_id: HashMap<BeliefId, Belief>,
+    by_entity: HashMap<EntityId, Vec<BeliefId>>,
+}
+
+impl BeliefIndex {
+    fn from_map(map: HashMap<BeliefId, Belief>) -> Self {
+        let mut index = Self {
+            by_id: map,
+            by_entity: HashMap::new(),
+        };
+
+        for (id, belief) in index.by_id.iter() {
+            index
+                .by_entity
+                .entry(belief.subject)
+                .or_default()
+                .push(*id);
+        }
+
+        index
+    }
+
+    fn insert(&mut self, belief: Belief) {
+        let id = belief.id;
+        let subject = belief.subject;
+        self.by_entity.entry(subject).or_default().push(id);
+        self.by_id.insert(id, belief);
+    }
+}
+
 pub struct PersistentBeliefStore {
     wal: Arc<WriteAheadLog>,
-    index: RwLock<HashMap<BeliefId, Belief>>,
+    index: RwLock<BeliefIndex>,
 }
 
 impl PersistentBeliefStore {
     fn new(wal: Arc<WriteAheadLog>) -> Self {
         Self {
             wal,
-            index: RwLock::new(HashMap::new()),
+            index: RwLock::new(BeliefIndex::default()),
         }
     }
 }
 
 impl BeliefStore for PersistentBeliefStore {
     fn insert(&self, belief: Belief) -> Result<(), StorageError> {
-        let mut index = self.index.write().unwrap();
-        
-        if index.contains_key(&belief.id) {
+        let mut index = self
+            .index
+            .write()
+            .map_err(|_| lock_err("belief.insert"))?;
+
+        if index.by_id.contains_key(&belief.id) {
             return Err(StorageError::DuplicateKey(format!("belief:{}", belief.id)));
         }
-        
-        self.wal.append(WalEntryKind::BeliefInsert(belief.clone()))
+
+        self
+            .wal
+            .append(WalEntryKind::BeliefInsert(belief.clone()))
             .map_err(|e| StorageError::BackendError(format!("WAL write failed: {}", e)))?;
-        
-        index.insert(belief.id, belief);
+
+        index.insert(belief);
         Ok(())
     }
     
     fn get(&self, id: BeliefId) -> Result<Option<Belief>, StorageError> {
-        Ok(self.index.read().unwrap().get(&id).cloned())
+        let index = self.index.read().map_err(|_| lock_err("belief.get"))?;
+        Ok(index.by_id.get(&id).cloned())
     }
     
     fn supersede(&self, old_id: BeliefId, new_id: BeliefId) -> Result<(), StorageError> {
-        let mut index = self.index.write().unwrap();
+        let mut index = self
+            .index
+            .write()
+            .map_err(|_| lock_err("belief.supersede"))?;
         
-        if !index.contains_key(&old_id) {
+        if !index.by_id.contains_key(&old_id) {
             return Err(StorageError::BeliefNotFound(old_id));
         }
         
         self.wal.append(WalEntryKind::BeliefSupersede { old_id, new_id })
             .map_err(|e| StorageError::BackendError(format!("WAL write failed: {}", e)))?;
         
-        if let Some(belief) = index.get_mut(&old_id) {
+        if let Some(belief) = index.by_id.get_mut(&old_id) {
             belief.superseded_by = Some(new_id);
         }
         Ok(())
     }
+
+    fn find_by_entity(&self, entity_id: EntityId) -> Result<Vec<Belief>, StorageError> {
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("belief.find_by_entity"))?;
+        let Some(ids) = index.by_entity.get(&entity_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut beliefs: Vec<Belief> = ids
+            .iter()
+            .filter_map(|id| index.by_id.get(id).cloned())
+            .collect();
+        beliefs.sort_by(|a, b| b.tx_time.cmp(&a.tx_time));
+        Ok(beliefs)
+    }
     
     fn find_by_entity_predicate(&self, entity_id: EntityId, predicate: &str) -> Result<Vec<Belief>, StorageError> {
-        let index = self.index.read().unwrap();
-        Ok(index.values()
-            .filter(|b| b.subject == entity_id && b.predicate == predicate)
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("belief.find_by_entity_predicate"))?;
+        let Some(ids) = index.by_entity.get(&entity_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut beliefs: Vec<Belief> = ids
+            .iter()
+            .filter_map(|id| index.by_id.get(id))
+            .filter(|b| b.predicate == predicate)
             .cloned()
-            .collect())
+            .collect();
+        beliefs.sort_by(|a, b| b.tx_time.cmp(&a.tx_time));
+        Ok(beliefs)
     }
     
     fn find_as_of(&self, entity_id: EntityId, predicate: &str, as_of: DateTime<Utc>) -> Result<Vec<Belief>, StorageError> {
-        let index = self.index.read().unwrap();
-        Ok(index.values()
-            .filter(|b| {
-                b.subject == entity_id
-                    && b.predicate == predicate
-                    && b.valid_time.contains(as_of)
-            })
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("belief.find_as_of"))?;
+        let Some(ids) = index.by_entity.get(&entity_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut beliefs: Vec<Belief> = ids
+            .iter()
+            .filter_map(|id| index.by_id.get(id))
+            .filter(|b| b.predicate == predicate && b.valid_time.contains(as_of))
             .cloned()
-            .collect())
+            .collect();
+        beliefs.sort_by(|a, b| b.tx_time.cmp(&a.tx_time));
+        Ok(beliefs)
     }
     
     fn find_by_time_range(&self, range: &TimeRange) -> Result<Vec<Belief>, StorageError> {
-        let index = self.index.read().unwrap();
-        Ok(index.values()
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("belief.find_by_time_range"))?;
+
+        let mut beliefs: Vec<Belief> = index
+            .by_id
+            .values()
             .filter(|b| b.valid_time.overlaps(range))
             .cloned()
-            .collect())
+            .collect();
+        beliefs.sort_by(|a, b| b.tx_time.cmp(&a.tx_time));
+        Ok(beliefs)
     }
     
     fn find_by_embedding(&self, embedding: &[f32], limit: usize, min_confidence: Option<f32>) -> Result<Vec<(Belief, f32)>, StorageError> {
-        let index = self.index.read().unwrap();
+        if embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("belief.find_by_embedding"))?;
         let min_conf = min_confidence.unwrap_or(0.0);
-        
-        let mut scored: Vec<_> = index.values()
-            .filter(|b| b.confidence.value() >= min_conf)
-            .filter_map(|b| {
-                b.embedding.as_ref().map(|emb| {
-                    let score = cosine_similarity(embedding, emb);
-                    (b.clone(), score)
-                })
-            })
-            .collect();
-        
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut scored: Vec<(Belief, f32)> = Vec::new();
+        for belief in index.by_id.values() {
+            if belief.confidence.value() < min_conf {
+                continue;
+            }
+            let Some(stored) = belief.embedding.as_ref() else {
+                continue;
+            };
+            let score = cosine_similarity(embedding, stored)?;
+            if score > 0.0 {
+                scored.push((belief.clone(), score));
+            }
+        }
+
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored.truncate(limit);
         Ok(scored)
     }
     
     fn count_by_entity(&self, entity_id: EntityId) -> Result<usize, StorageError> {
-        let index = self.index.read().unwrap();
-        Ok(index.values().filter(|b| b.subject == entity_id).count())
+        let index = self
+            .index
+            .read()
+            .map_err(|_| lock_err("belief.count_by_entity"))?;
+        Ok(index.by_entity.get(&entity_id).map_or(0, Vec::len))
     }
 }
 
@@ -747,20 +1412,32 @@ impl DerivationStore for PersistentDerivationStore {
 
 // --- Utility Functions ---
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, StorageError> {
+    if a.is_empty() {
+        return Ok(0.0);
     }
-    
+    if a.len() != b.len() {
+        return Err(StorageError::BackendError(format!(
+            "embedding dimension mismatch: query={} stored={}",
+            a.len(),
+            b.len()
+        )));
+    }
+
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    
+
     if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
+        return Ok(0.0);
     }
-    
-    dot / (norm_a * norm_b)
+
+    let sim = dot / (norm_a * norm_b);
+    if sim.is_finite() {
+        Ok(sim)
+    } else {
+        Ok(0.0)
+    }
 }
 
 #[cfg(test)]
@@ -845,6 +1522,74 @@ mod tests {
             let entity = stores.entities.get(entity_id).unwrap();
             assert!(entity.is_some());
             assert_eq!(entity.unwrap().canonical_name, "survive_compaction");
+        }
+    }
+
+    #[test]
+    fn test_entity_merge_records_versions_and_redirects() {
+        let dir = tempdir().unwrap();
+
+        let stores = PersistentStores::open(dir.path(), PersistentConfig::default()).unwrap();
+        let primary = Entity::new("primary", EntityType::Concept);
+        let secondary = Entity::new("secondary", EntityType::Concept);
+        let primary_id = primary.id;
+        let secondary_id = secondary.id;
+
+        stores.entities.insert(primary.clone()).unwrap();
+        stores.entities.insert(secondary.clone()).unwrap();
+
+        let merged = stores.entities.merge(primary_id, secondary_id).unwrap();
+
+        assert_eq!(merged.id, primary_id);
+        assert!(merged.version > primary.version);
+        assert!(merged.aliases.iter().any(|a| a.eq_ignore_ascii_case("secondary")));
+
+        let primary_resolved = stores.entities.get(primary_id).unwrap().unwrap();
+        let secondary_resolved = stores.entities.get(secondary_id).unwrap().unwrap();
+        assert_eq!(primary_resolved.id, primary_id);
+        assert_eq!(secondary_resolved.id, primary_id);
+
+        let versions = stores.entities.list_versions(primary_id).unwrap();
+        assert!(versions.iter().any(|v| v.version == 1));
+        assert!(versions.iter().any(|v| v.version == merged.version));
+
+        let secondary_versions = stores.entities.list_versions(secondary_id).unwrap();
+        assert_eq!(secondary_versions.len(), 1);
+    }
+
+    #[test]
+    fn test_entity_versions_survive_reopen() {
+        let dir = tempdir().unwrap();
+        let entity_id;
+
+        {
+            let mut stores = PersistentStores::open(dir.path(), PersistentConfig::default()).unwrap();
+            let entity = Entity::new("versioned", EntityType::Concept);
+            entity_id = entity.id;
+            stores.entities.insert(entity.clone()).unwrap();
+
+            let mut updated = entity.clone();
+            updated.version = 2;
+            updated.canonical_name = "versioned-renamed".to_string();
+            stores.entities.update(updated).unwrap();
+
+            // Persist to a segment and reset WAL
+            stores.compact().unwrap();
+        }
+
+        {
+            let stores = PersistentStores::open(dir.path(), PersistentConfig::default()).unwrap();
+
+            let v1 = stores.entities.get_at_version(entity_id, 1).unwrap().unwrap();
+            assert_eq!(v1.version, 1);
+            assert_eq!(v1.canonical_name, "versioned");
+
+            let v2 = stores.entities.get_at_version(entity_id, 2).unwrap().unwrap();
+            assert_eq!(v2.version, 2);
+            assert_eq!(v2.canonical_name, "versioned-renamed");
+
+            let versions = stores.entities.list_versions(entity_id).unwrap();
+            assert_eq!(versions.len(), 2);
         }
     }
 }
